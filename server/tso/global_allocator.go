@@ -226,9 +226,12 @@ func (gta *GlobalTSOAllocator) syncMaxTS(ctx context.Context, dcLocationMap map[
 			if resp == nil {
 				return errs.ErrSyncMaxTS.FastGenWithCause("got nil response")
 			}
-			// Once we get a non-nil or non-zero MaxLocalTs first, we will think it's in the first phase
+			// Once we get a non-nil and non-zero MaxLocalTs first, we will think it's in the first phase
 			// of the Global TSO synchronization. So that we can have more detailed processing logic
-			// for each phase.
+			// for each phase. For example, if we think we're in the first phase of the Global TSO
+			// synchronization, the inCollectingPhase will be set to true, and during this phase,
+			// any response with nil or empty MaxLocalTs will be regarded as an invalid response.
+			// Then the whole synchronization will fail.
 			if respCount == 1 && resp.GetMaxLocalTs() != nil && resp.GetMaxLocalTs().GetPhysical() != 0 {
 				inCollectingPhase = true
 			}
