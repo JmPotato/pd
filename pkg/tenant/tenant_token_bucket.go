@@ -111,6 +111,8 @@ func Add(self *pdpb.Consumption, other *pdpb.Consumption) {
 	self.WriteRequests += other.WriteRequests
 	self.WriteBytes += other.WriteBytes
 	self.PodsCpuSeconds += other.PodsCpuSeconds
+	self.KvReadCpuMilliseconds += other.KvReadCpuMilliseconds
+	self.KvWriteCpuMilliseconds += other.KvWriteCpuMilliseconds
 }
 
 // Sub subtracts consumption, making sure no fields become negative.
@@ -149,5 +151,17 @@ func Sub(c *pdpb.Consumption, other *pdpb.Consumption) {
 		c.PodsCpuSeconds = 0
 	} else {
 		c.PodsCpuSeconds -= other.PodsCpuSeconds
+	}
+
+	if c.KvReadCpuMilliseconds < other.KvReadCpuMilliseconds {
+		c.KvReadCpuMilliseconds = 0
+	} else {
+		c.KvReadCpuMilliseconds -= other.KvReadCpuMilliseconds
+	}
+
+	if c.KvWriteCpuMilliseconds < other.KvWriteCpuMilliseconds {
+		c.KvWriteCpuMilliseconds = 0
+	} else {
+		c.KvWriteCpuMilliseconds -= other.KvWriteCpuMilliseconds
 	}
 }

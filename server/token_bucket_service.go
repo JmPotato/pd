@@ -61,6 +61,8 @@ func (s *Server) TokenBucketRequest(
 	tenantConsumption.WithLabelValues(fmt.Sprintf("%d", tenantID), "total_read_bytes").Set(float64(consumption.GetReadBytes()))
 	tenantConsumption.WithLabelValues(fmt.Sprintf("%d", tenantID), "total_write_bytes").Set(float64(consumption.GetWriteBytes()))
 	tenantConsumption.WithLabelValues(fmt.Sprintf("%d", tenantID), "total_cpu_seconds").Set(float64(consumption.GetPodsCpuSeconds()))
+	tenantConsumption.WithLabelValues(fmt.Sprintf("%d", tenantID), "total_kv_read_cpu_milliseconds").Set(float64(consumption.GetKvReadCpuMilliseconds()))
+	tenantConsumption.WithLabelValues(fmt.Sprintf("%d", tenantID), "total_kv_write_cpu_milliseconds").Set(float64(consumption.GetKvWriteCpuMilliseconds()))
 
 	TenantTokenBucketState.WithLabelValues(fmt.Sprintf("%d", tenantID), "ru_token_reamining").Set(float64(tenantInfo.Bucket.RUCurrent))
 	TenantTokenBucketState.WithLabelValues(fmt.Sprintf("%d", tenantID), "ru_token_refillRate").Set(float64(tenantInfo.Bucket.RURefillRate))
