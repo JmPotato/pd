@@ -534,6 +534,9 @@ func (s *Server) Run() error {
 		return err
 	}
 
+	failpoint.Inject("delayStartServerLoop", func() {
+		time.Sleep(2 * time.Second)
+	})
 	s.startServerLoop(s.ctx)
 
 	return nil
