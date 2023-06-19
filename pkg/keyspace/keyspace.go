@@ -106,11 +106,16 @@ func NewKeyspaceManager(
 	kgm *GroupManager,
 ) *Manager {
 	return &Manager{
-		metaLock:          syncutil.NewLockGroup(syncutil.WithHash(MaskKeyspaceID)),
+		ctx: ctx,
+		// Remove the lock of the given key from the lock group when unlock to
+		// keep minimal working set, which is suited for low qps, non-time-critical
+		// and non-consecutive large key space scenarios. One of scenarios for
+		// last use case is keyspace group split loads non-consecutive keyspace meta
+		// in batches and lock all loaded keyspace meta within a batch at the same time.
+		metaLock:          syncutil.NewLockGroup(syncutil.WithRemoveEntryOnUnlock(true)),
 		idAllocator:       idAllocator,
 		store:             store,
 		cluster:           cluster,
-		ctx:               ctx,
 		config:            config,
 		kgm:               kgm,
 		nextPatrolStartID: utils.DefaultKeyspaceID,
