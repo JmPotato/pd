@@ -44,6 +44,8 @@ func RegisterTSOKeyspaceGroup(r *gin.RouterGroup) {
 	router.POST("/:id/priority", SetPriorityForKeyspaceGroup)
 	router.POST("/:id/split", SplitKeyspaceGroupByID)
 	router.DELETE("/:id/split", FinishSplitKeyspaceByID)
+	router.POST("/:id/merge", MergeKeyspaceGroups)
+	router.DELETE("/:id/merge", FinishMergeKeyspaceByID)
 }
 
 // CreateKeyspaceGroupParams defines the params for creating keyspace groups.
@@ -159,6 +161,9 @@ func DeleteKeyspaceGroupByID(c *gin.Context) {
 type SplitKeyspaceGroupByIDParams struct {
 	NewID     uint32   `json:"new-id"`
 	Keyspaces []uint32 `json:"keyspaces"`
+	// StartKeyspaceID and EndKeyspaceID are used to indicate the range of keyspaces to be split.
+	StartKeyspaceID uint32 `json:"start-keyspace-id"`
+	EndKeyspaceID   uint32 `json:"end-keyspace-id"`
 }
 
 var patrolKeyspaceAssignmentState struct {
@@ -184,8 +189,13 @@ func SplitKeyspaceGroupByID(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, "invalid keyspace group id")
 		return
 	}
-	if len(splitParams.Keyspaces) == 0 {
+	if len(splitParams.Keyspaces) == 0 && splitParams.StartKeyspaceID == 0 && splitParams.EndKeyspaceID == 0 {
 		c.AbortWithStatusJSON(http.StatusBadRequest, "invalid empty keyspaces")
+		return
+	}
+	if splitParams.StartKeyspaceID < utils.DefaultKeyspaceID ||
+		splitParams.StartKeyspaceID > splitParams.EndKeyspaceID {
+		c.AbortWithStatusJSON(http.StatusBadRequest, "invalid start/end keyspace id")
 		return
 	}
 
@@ -198,7 +208,7 @@ func SplitKeyspaceGroupByID(c *gin.Context) {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, managerUninitializedErr)
 			return
 		}
-		err = manager.PatrolKeyspaceAssignment()
+		err = manager.PatrolKeyspaceAssignment(splitParams.StartKeyspaceID, splitParams.EndKeyspaceID)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, err.Error())
 			patrolKeyspaceAssignmentState.Unlock()
@@ -207,13 +217,15 @@ func SplitKeyspaceGroupByID(c *gin.Context) {
 		patrolKeyspaceAssignmentState.patrolled = true
 	}
 	patrolKeyspaceAssignmentState.Unlock()
-	// Split keyspace group.
 	groupManager := svr.GetKeyspaceGroupManager()
 	if groupManager == nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, groupManagerUninitializedErr)
 		return
 	}
-	err = groupManager.SplitKeyspaceGroupByID(id, splitParams.NewID, splitParams.Keyspaces)
+	// Split keyspace group.
+	err = groupManager.SplitKeyspaceGroupByID(
+		id, splitParams.NewID,
+		splitParams.Keyspaces, splitParams.StartKeyspaceID, splitParams.EndKeyspaceID)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, err.Error())
 		return
@@ -232,6 +244,68 @@ func FinishSplitKeyspaceByID(c *gin.Context) {
 	svr := c.MustGet(middlewares.ServerContextKey).(*server.Server)
 	manager := svr.GetKeyspaceGroupManager()
 	err = manager.FinishSplitKeyspaceByID(id)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, nil)
+}
+
+// MergeKeyspaceGroupsParams defines the params for merging the keyspace groups.
+type MergeKeyspaceGroupsParams struct {
+	MergeList []uint32 `json:"merge-list"`
+}
+
+// MergeKeyspaceGroups merges the keyspace groups in the merge list into the target keyspace group.
+func MergeKeyspaceGroups(c *gin.Context) {
+	id, err := validateKeyspaceGroupID(c)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, "invalid keyspace group id")
+		return
+	}
+	mergeParams := &MergeKeyspaceGroupsParams{}
+	err = c.BindJSON(mergeParams)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, errs.ErrBindJSON.Wrap(err).GenWithStackByCause())
+		return
+	}
+	if len(mergeParams.MergeList) == 0 {
+		c.AbortWithStatusJSON(http.StatusBadRequest, "invalid empty merge list")
+		return
+	}
+	for _, mergeID := range mergeParams.MergeList {
+		if !isValid(mergeID) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, "invalid keyspace group id")
+			return
+		}
+	}
+
+	svr := c.MustGet(middlewares.ServerContextKey).(*server.Server)
+	groupManager := svr.GetKeyspaceGroupManager()
+	if groupManager == nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, groupManagerUninitializedErr)
+		return
+	}
+	// Merge keyspace group.
+	err = groupManager.MergeKeyspaceGroups(id, mergeParams.MergeList)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, nil)
+}
+
+// FinishMergeKeyspaceByID finishes merging keyspace group by ID.
+func FinishMergeKeyspaceByID(c *gin.Context) {
+	id, err := validateKeyspaceGroupID(c)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, "invalid keyspace group id")
+		return
+	}
+
+	svr := c.MustGet(middlewares.ServerContextKey).(*server.Server)
+	manager := svr.GetKeyspaceGroupManager()
+	err = manager.FinishMergeKeyspaceByID(id)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, err.Error())
 		return
