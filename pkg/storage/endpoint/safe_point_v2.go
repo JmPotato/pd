@@ -46,7 +46,6 @@ type ServiceSafePointV2 struct {
 type SafePointV2Storage interface {
 	LoadGCSafePointV2(keyspaceID uint32) (*GCSafePointV2, error)
 	SaveGCSafePointV2(gcSafePoint *GCSafePointV2) error
-	LoadAllGCSafePoints() ([]*GCSafePointV2, error)
 
 	LoadMinServiceSafePointV2(keyspaceID uint32, now time.Time) (*ServiceSafePointV2, error)
 	LoadServiceSafePointV2(keyspaceID uint32, serviceID string) (*ServiceSafePointV2, error)
@@ -86,25 +85,6 @@ func (se *StorageEndpoint) SaveGCSafePointV2(gcSafePoint *GCSafePointV2) error {
 		return errs.ErrJSONMarshal.Wrap(err).GenWithStackByCause()
 	}
 	return se.Save(key, string(value))
-}
-
-// LoadAllGCSafePoints returns gc safe point for all keyspaces
-func (se *StorageEndpoint) LoadAllGCSafePoints() ([]*GCSafePointV2, error) {
-	prefix := GCSafePointV2Prefix()
-	prefixEnd := clientv3.GetPrefixRangeEnd(prefix)
-	_, values, err := se.LoadRange(prefix, prefixEnd, 0)
-	if err != nil {
-		return nil, err
-	}
-	gcSafePoints := make([]*GCSafePointV2, 0, len(values))
-	for _, value := range values {
-		gcSafePoint := &GCSafePointV2{}
-		if err = json.Unmarshal([]byte(value), gcSafePoint); err != nil {
-			return nil, errs.ErrJSONUnmarshal.Wrap(err).GenWithStackByCause()
-		}
-		gcSafePoints = append(gcSafePoints, gcSafePoint)
-	}
-	return gcSafePoints, nil
 }
 
 // LoadMinServiceSafePointV2 returns the minimum safepoint for the given keyspace.
