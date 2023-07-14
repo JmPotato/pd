@@ -55,10 +55,7 @@ require (
 	gotest.tools/gotestsum v1.7.0
 )
 
-require (
-	github.com/golang/glog v1.1.0 // indirect
-	github.com/shirou/gopsutil v3.21.3+incompatible // indirect
-)
+require github.com/shirou/gopsutil v3.21.3+incompatible // indirect
 
 require (
 	github.com/KyleBanks/depth v1.2.1 // indirect
