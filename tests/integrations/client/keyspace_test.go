@@ -16,6 +16,7 @@ package client_test
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/keyspacepb"
@@ -117,6 +118,33 @@ func (suite *clientTestSuite) TestWatchKeyspaces() {
 	re.NoError(err)
 	loaded = <-watchChan
 	re.Equal([]*keyspacepb.KeyspaceMeta{expected}, loaded)
+}
+
+func (suite *clientTestSuite) TestGetAllKeyspaces() {
+	re := suite.Require()
+	metas := mustMakeTestKeyspaces(re, suite.srv, 20, 10)
+	for _, expected := range metas {
+		loaded, err := suite.client.LoadKeyspace(suite.ctx, expected.GetName())
+		re.NoError(err)
+		re.Equal(expected, loaded)
+	}
+	// Get all keyspaces.
+	resKeyspaces, err := suite.client.GetAllKeyspaces(suite.ctx, 1, math.MaxUint32)
+	re.NoError(err)
+	re.Equal(len(metas), len(resKeyspaces))
+	// Check expected keyspaces all in resKeyspaces.
+	for _, expected := range metas {
+		var isExists bool
+		for _, resKeyspace := range resKeyspaces {
+			if expected.GetName() == resKeyspace.GetName() {
+				isExists = true
+				continue
+			}
+		}
+		if !isExists {
+			re.Fail("not exists keyspace")
+		}
+	}
 }
 
 func mustCreateKeyspaceAtState(re *require.Assertions, server *server.Server, index int, state keyspacepb.KeyspaceState) *keyspacepb.KeyspaceMeta {
