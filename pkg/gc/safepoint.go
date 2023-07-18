@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/utils/syncutil"
 	"github.com/tikv/pd/server/config"
+	"go.uber.org/zap"
 )
 
 // SafePointManager is the manager for safePoint of GC and services.
@@ -34,7 +36,15 @@ type SafePointManager struct {
 
 // NewSafePointManager creates a SafePointManager of GC and services.
 func NewSafePointManager(store endpoint.GCSafePointStorage, cfg config.PDServerConfig) *SafePointManager {
-	return &SafePointManager{store: store, cfg: cfg}
+	manager := &SafePointManager{store: store, cfg: cfg}
+	// load the gc safepoint from storage to initialize `pd_gc_gc_safepoint` metric.
+	gcSafepoint, err := manager.LoadGCSafePoint()
+	if err != nil {
+		log.Error("failed to load gc safepoint", zap.Error(err))
+	} else {
+		gcSafePointGauge.WithLabelValues("gc_safepoint").Set(float64(gcSafepoint))
+	}
+	return manager
 }
 
 // LoadGCSafePoint loads current GC safe point from storage.
