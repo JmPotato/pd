@@ -84,13 +84,20 @@ func (suite *clientTestSuite) TestWatchKeyspaces() {
 	additionalKeyspaces := mustMakeTestKeyspaces(re, suite.srv, 30, 10)
 	re.NoError(err)
 	// Checks that all additional keyspaces are captured by watch channel.
-	for i := 0; i < 10; {
+	ksID := 0
+	for i := 0; i < 20; i++ {
 		loadedKeyspaces := <-watchChan
+		// Create keyspace need disable at first,and update to enabled after split succ.
+		// So it will watch 2 states.
+		if i%2 == 0 {
+			continue
+		}
+
 		re.NotEmpty(loadedKeyspaces)
 		for j := range loadedKeyspaces {
-			re.Equal(additionalKeyspaces[i+j], loadedKeyspaces[j])
+			re.Equal(additionalKeyspaces[ksID+j], loadedKeyspaces[j])
 		}
-		i += len(loadedKeyspaces)
+		ksID++
 	}
 	// Updates to state should also be captured.
 	expected, err := suite.srv.GetKeyspaceManager().UpdateKeyspaceState(initialKeyspaces[0].Name, keyspacepb.KeyspaceState_DISABLED, time.Now().Unix())
