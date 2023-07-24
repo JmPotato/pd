@@ -70,6 +70,8 @@ var (
 	}
 	// ErrKeyspaceNotInKeyspaceGroup is used to indicate target keyspace is not in this keyspace group.
 	ErrKeyspaceNotInKeyspaceGroup = errors.New("keyspace is not in this keyspace group")
+	// ErrKeyspaceNotInAnyKeyspaceGroup is used to indicate target keyspace is not in any keyspace group.
+	ErrKeyspaceNotInAnyKeyspaceGroup = errors.New("keyspace is not in any keyspace group")
 	// ErrNodeNotInKeyspaceGroup is used to indicate the tso node is not in this keyspace group.
 	ErrNodeNotInKeyspaceGroup = errors.New("the tso node is not in this keyspace group")
 	// ErrKeyspaceGroupNotEnoughReplicas is used to indicate not enough replicas in the keyspace group.
@@ -94,6 +96,9 @@ var (
 	}
 	// Only keyspaces in the state specified by allowChangeConfig are allowed to change their config.
 	allowChangeConfig = []keyspacepb.KeyspaceState{keyspacepb.KeyspaceState_ENABLED, keyspacepb.KeyspaceState_DISABLED}
+
+	// ErrKeyspaceGroupPrimaryNotFound is used to indicate primary of target keyspace group does not exist.
+	ErrKeyspaceGroupPrimaryNotFound = errors.New("primary of keyspace group does not exist")
 )
 
 // validateID check if keyspace falls within the acceptable range.

@@ -51,6 +51,7 @@ type option struct {
 	timeout          time.Duration
 	maxRetryTimes    int
 	enableForwarding bool
+	allowTSOFallback bool
 
 	// Dynamic options.
 	dynamicOptions [dynamicOptionCount]atomic.Value

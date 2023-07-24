@@ -88,6 +88,8 @@ func NewTSOServiceCommand() *cobra.Command {
 	cmd.Flags().StringP("cacert", "", "", "path of file that contains list of trusted TLS CAs")
 	cmd.Flags().StringP("cert", "", "", "path of file that contains X509 certificate in PEM format")
 	cmd.Flags().StringP("key", "", "", "path of file that contains X509 key in PEM format")
+	cmd.Flags().StringP("log-level", "L", "info", "log level: debug, info, warn, error, fatal (default 'info')")
+	cmd.Flags().StringP("log-file", "", "", "log file path")
 	return cmd
 }
 
@@ -106,6 +108,8 @@ func NewResourceManagerServiceCommand() *cobra.Command {
 	cmd.Flags().StringP("cacert", "", "", "path of file that contains list of trusted TLS CAs")
 	cmd.Flags().StringP("cert", "", "", "path of file that contains X509 certificate in PEM format")
 	cmd.Flags().StringP("key", "", "", "path of file that contains X509 key in PEM format")
+	cmd.Flags().StringP("log-level", "L", "info", "log level: debug, info, warn, error, fatal (default 'info')")
+	cmd.Flags().StringP("log-file", "", "", "log file path")
 	return cmd
 }
 

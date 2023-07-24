@@ -349,6 +349,8 @@ func (c *client) tryResourceManagerConnect(ctx context.Context, connection *reso
 		err    error
 		stream rmpb.ResourceManager_AcquireTokenBucketsClient
 	)
+	ticker := time.NewTicker(retryInterval)
+	defer ticker.Stop()
 	for i := 0; i < maxRetryTimes; i++ {
 		cctx, cancel := context.WithCancel(ctx)
 		stream, err = c.resourceManagerClient().AcquireTokenBuckets(cctx)
@@ -362,7 +364,7 @@ func (c *client) tryResourceManagerConnect(ctx context.Context, connection *reso
 		select {
 		case <-ctx.Done():
 			return err
-		case <-time.After(retryInterval):
+		case <-ticker.C:
 		}
 	}
 	return err

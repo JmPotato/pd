@@ -54,7 +54,7 @@ type tsoClientTestSuite struct {
 	// pdLeaderServer is the leader server of the PD cluster.
 	pdLeaderServer *tests.TestServer
 	// The TSO service in microservice mode.
-	tsoCluster *mcs.TestTSOCluster
+	tsoCluster *tests.TestTSOCluster
 
 	keyspaceGroups []struct {
 		keyspaceGroupID uint32
@@ -108,7 +108,7 @@ func (suite *tsoClientTestSuite) SetupSuite() {
 		suite.clients = make([]pd.Client, 0)
 		suite.clients = append(suite.clients, client)
 	} else {
-		suite.tsoCluster, err = mcs.NewTestTSOCluster(suite.ctx, 3, suite.backendEndpoints)
+		suite.tsoCluster, err = tests.NewTestTSOCluster(suite.ctx, 3, suite.backendEndpoints)
 		re.NoError(err)
 
 		suite.keyspaceGroups = []struct {
@@ -430,13 +430,13 @@ func TestMixedTSODeployment(t *testing.T) {
 	err = apiSvr.Run()
 	re.NoError(err)
 
-	s, cleanup := mcs.StartSingleTSOTestServer(ctx, re, backendEndpoints, tempurl.Alloc())
+	s, cleanup := tests.StartSingleTSOTestServer(ctx, re, backendEndpoints, tempurl.Alloc())
 	defer cleanup()
-	mcs.WaitForPrimaryServing(re, map[string]bs.Server{s.GetAddr(): s})
+	tests.WaitForPrimaryServing(re, map[string]bs.Server{s.GetAddr(): s})
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	checkTSO(ctx1, re, &wg, backendEndpoints)
+	checkTSO(ctx1, re, &wg, backendEndpoints, pd.WithAllowTSOFallback() /* It's expected that the timestamp fallback happens here */)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -451,12 +451,62 @@ func TestMixedTSODeployment(t *testing.T) {
 	wg.Wait()
 }
 
-func checkTSO(ctx context.Context, re *require.Assertions, wg *sync.WaitGroup, backendEndpoints string) {
+// TestUpgradingAPIandTSOClusters tests the scenario that after we restart the API cluster
+// then restart the TSO cluster, the TSO service can still serve TSO requests normally.
+func TestUpgradingAPIandTSOClusters(t *testing.T) {
+	re := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Create an API cluster which has 3 servers
+	apiCluster, err := tests.NewTestAPICluster(ctx, 3)
+	re.NoError(err)
+	err = apiCluster.RunInitialServers()
+	re.NoError(err)
+	leaderName := apiCluster.WaitLeader()
+	pdLeader := apiCluster.GetServer(leaderName)
+	backendEndpoints := pdLeader.GetAddr()
+
+	// Create a pd client in PD mode to let the API leader to forward requests to the TSO cluster.
+	re.NoError(failpoint.Enable("github.com/tikv/pd/client/usePDServiceMode", "return(true)"))
+	pdClient, err := pd.NewClientWithContext(context.Background(),
+		[]string{backendEndpoints}, pd.SecurityOption{}, pd.WithMaxErrorRetry(1))
+	re.NoError(err)
+
+	// Create a TSO cluster which has 2 servers
+	tsoCluster, err := tests.NewTestTSOCluster(ctx, 2, backendEndpoints)
+	re.NoError(err)
+	tsoCluster.WaitForDefaultPrimaryServing(re)
+	// The TSO service should be eventually healthy
+	mcs.WaitForTSOServiceAvailable(ctx, re, pdClient)
+
+	// Restart the API cluster
+	apiCluster, err = tests.RestartTestAPICluster(ctx, apiCluster)
+	re.NoError(err)
+	// The TSO service should be eventually healthy
+	mcs.WaitForTSOServiceAvailable(ctx, re, pdClient)
+
+	// Restart the TSO cluster
+	tsoCluster, err = tests.RestartTestTSOCluster(ctx, tsoCluster)
+	re.NoError(err)
+	// The TSO service should be eventually healthy
+	mcs.WaitForTSOServiceAvailable(ctx, re, pdClient)
+
+	tsoCluster.Destroy()
+	apiCluster.Destroy()
+	cancel()
+	re.NoError(failpoint.Disable("github.com/tikv/pd/client/usePDServiceMode"))
+}
+
+func checkTSO(
+	ctx context.Context, re *require.Assertions, wg *sync.WaitGroup,
+	backendEndpoints string, opts ...pd.ClientOption,
+) {
 	wg.Add(tsoRequestConcurrencyNumber)
 	for i := 0; i < tsoRequestConcurrencyNumber; i++ {
 		go func() {
 			defer wg.Done()
-			cli := mcs.SetupClientWithAPIContext(ctx, re, pd.NewAPIContextV1(), strings.Split(backendEndpoints, ","))
+			cli := mcs.SetupClientWithAPIContext(ctx, re, pd.NewAPIContextV1(), strings.Split(backendEndpoints, ","), opts...)
+			defer cli.Close()
 			var ts, lastTS uint64
 			for {
 				select {

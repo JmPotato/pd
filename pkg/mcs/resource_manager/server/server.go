@@ -29,7 +29,9 @@ import (
 	"time"
 
 	grpcprometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/pingcap/kvproto/pkg/diagnosticspb"
 	"github.com/pingcap/log"
+	"github.com/pingcap/sysutil"
 	"github.com/soheilhy/cmux"
 	"github.com/spf13/cobra"
 	"github.com/tikv/pd/pkg/errs"
@@ -47,8 +49,11 @@ import (
 // Server is the resource manager server, and it implements bs.Server.
 // nolint
 type Server struct {
+	diagnosticspb.DiagnosticsServer
 	// Server state. 0 is not running, 1 is running.
 	isRunning int64
+	// Server start timestamp
+	startTimestamp int64
 
 	ctx          context.Context
 	serverLoopWg sync.WaitGroup
@@ -185,9 +190,11 @@ func (s *Server) startGRPCServer(l net.Listener) {
 		gs.GracefulStop()
 		close(done)
 	}()
+	timer := time.NewTimer(utils.DefaultGRPCGracefulStopTimeout)
+	defer timer.Stop()
 	select {
 	case <-done:
-	case <-time.After(utils.DefaultGRPCGracefulStopTimeout):
+	case <-timer.C:
 		log.Info("stopping grpc gracefully is taking longer than expected and force stopping now", zap.Duration("default", utils.DefaultGRPCGracefulStopTimeout))
 		gs.Stop()
 	}
@@ -294,13 +301,15 @@ func (s *Server) startServer() error {
 	return nil
 }
 
-// NewServer creates a new resource manager server.
-func NewServer(ctx context.Context, cfg *Config) *Server {
-	return &Server{
-		name: cfg.Name,
-		ctx:  ctx,
-		cfg:  cfg,
+// CreateServer creates the Server
+func CreateServer(ctx context.Context, cfg *Config) *Server {
+	svr := &Server{
+		DiagnosticsServer: sysutil.NewDiagnosticsServer(cfg.Log.File.Filename),
+		startTimestamp:    time.Now().Unix(),
+		cfg:               cfg,
+		ctx:               ctx,
 	}
+	return svr
 }
 
 // CreateServerWrapper encapsulates the configuration/log/metrics initialization and create the server
@@ -334,15 +343,14 @@ func CreateServerWrapper(cmd *cobra.Command, args []string) {
 	// Flushing any buffered log entries
 	defer log.Sync()
 
-	versioninfo.Log("resource manager")
-	log.Info("resource manager config", zap.Reflect("config", cfg))
+	versioninfo.Log("Resource Manager")
+	log.Info("Resource Manager config", zap.Reflect("config", cfg))
 
 	grpcprometheus.EnableHandlingTimeHistogram()
-
 	metricutil.Push(&cfg.Metric)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	svr := NewServer(ctx, cfg)
+	svr := CreateServer(ctx, cfg)
 
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc,
