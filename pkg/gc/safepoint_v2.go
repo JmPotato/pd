@@ -74,10 +74,11 @@ func (manager *SafePointV2Manager) LoadGCSafePoint(keyspaceID uint32) (*endpoint
 	if err := manager.checkKeyspace(keyspaceID, false); err != nil {
 		return nil, err
 	}
-	gcSafePoint, err := manager.getGCSafePoint(keyspaceID)
+	gcSafePoint, isGetFromV2, err := manager.getGCSafePoint(keyspaceID)
 	if err != nil {
 		log.Warn("failed to load gc safe point",
 			zap.Uint32("keyspace-id", keyspaceID),
+			zap.Bool("is-get-from-v2", isGetFromV2),
 			zap.Error(err),
 		)
 		return nil, err
@@ -117,23 +118,26 @@ func (manager *SafePointV2Manager) checkKeyspace(keyspaceID uint32, updateReques
 }
 
 // getGCSafePoint first try to load gc safepoint from v2 storage, if failed, load from v1 storage instead.
-func (manager *SafePointV2Manager) getGCSafePoint(keyspaceID uint32) (*endpoint.GCSafePointV2, error) {
+func (manager *SafePointV2Manager) getGCSafePoint(keyspaceID uint32) (*endpoint.GCSafePointV2, bool, error) {
+	isGetFromV2 := true
 	v2SafePoint, err := manager.v2Storage.LoadGCSafePointV2(keyspaceID)
 	if err != nil {
-		return nil, err
+		return nil, isGetFromV2, err
 	}
+
 	// If failed to find a valid safe point, check if a safe point exist in v1 storage, and use it.
 	if v2SafePoint.SafePoint == 0 {
+		isGetFromV2 = false
 		v1SafePoint, err := manager.v1Storage.LoadGCSafePoint()
 		if err != nil {
-			return nil, err
+			return nil, isGetFromV2, err
 		}
 		log.Info("keyspace does not have a gc safe point, using v1 gc safe point instead",
 			zap.Uint32("keyspace-id", keyspaceID),
 			zap.Uint64("gc-safe-point-v1", v1SafePoint))
 		v2SafePoint.SafePoint = v1SafePoint
 	}
-	return v2SafePoint, nil
+	return v2SafePoint, isGetFromV2, nil
 }
 
 // UpdateGCSafePoint is used to update gc safe point for given keyspace.
@@ -144,11 +148,11 @@ func (manager *SafePointV2Manager) UpdateGCSafePoint(gcSafePoint *endpoint.GCSaf
 	if err = manager.checkKeyspace(gcSafePoint.KeyspaceID, true); err != nil {
 		return
 	}
-	oldGCSafePoint, err = manager.getGCSafePoint(gcSafePoint.KeyspaceID)
+	oldGCSafePoint, isGetFromV2, err := manager.getGCSafePoint(gcSafePoint.KeyspaceID)
 	if err != nil {
 		return
 	}
-	if oldGCSafePoint.SafePoint >= gcSafePoint.SafePoint {
+	if oldGCSafePoint.SafePoint > gcSafePoint.SafePoint || (isGetFromV2 && oldGCSafePoint.SafePoint == gcSafePoint.SafePoint) {
 		return
 	}
 	err = manager.v2Storage.SaveGCSafePointV2(gcSafePoint)
