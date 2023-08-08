@@ -1,0 +1,34 @@
+name: CI
+on:
+  push:
+    branches: ['release-6.6-keyspace']
+  pull_request:
+    branches: ['release-6.6-keyspace']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pd-cse-build:
+    runs-on: self-hosted
+    env:
+      GITHUB_TOKEN: ${{ secrets.GIT_ACTION_BOT }}
+      GOPRIVATE: github.com/tidbcloud
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-go@v4
+        with:
+          go-version-file: 'go.mod'
+      - name: build
+        shell: bash
+        env:
+          DASHBOARD: 0
+          SWAGGER: 0
+          CGO_ENABLED: 0
+        run: |
+          git config --global url.https://$GITHUB_TOKEN@github.com/.insteadOf https://github.com/
+          make

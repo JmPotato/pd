@@ -1,0 +1,12 @@
+FROM debian:bullseye-20220711-slim
+RUN apt update && apt install -y jq bash curl dnsutils wget && rm /bin/sh && ln -s /bin/bash /bin/sh && \
+    apt-get clean autoclean && apt-get autoremove --yes
+
+ARG TARGETARCH
+COPY ./tmp/pd-server-${TARGETARCH} /pd-server
+COPY ./tmp/pd-ctl-${TARGETARCH} /pd-ctl
+COPY ./tmp/pd-recover-${TARGETARCH} /pd-recover
+
+EXPOSE 2379 2380
+
+ENTRYPOINT ["/pd-server"]

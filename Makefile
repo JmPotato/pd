@@ -77,6 +77,30 @@ pd-server-basic:
 
 .PHONY: build tools pd-server pd-server-basic
 
+# CD pipeline build
+build-cd: pd-server-cd pd-ctl-cd pd-recover-cd
+
+pd-server-cd:
+ifeq ($(CD_BIN_PATH),)
+	go build $(BUILD_FLAGS) -gcflags '$(GCFLAGS)' -ldflags '$(LDFLAGS)' -tags "$(BUILD_TAGS)" -o $(BUILD_BIN_PATH)/pd-server cmd/pd-server/main.go
+else
+	go build $(BUILD_FLAGS) -gcflags '$(GCFLAGS)' -ldflags '$(LDFLAGS)' -tags "$(BUILD_TAGS)" -o $(CD_BIN_PATH)/pd-server-$(GOARCH) cmd/pd-server/main.go
+endif
+
+pd-ctl-cd:
+ifeq ($(CD_BIN_PATH),)
+	go build -gcflags '$(GCFLAGS)' -ldflags '$(LDFLAGS)' -o $(BUILD_BIN_PATH)/pd-ctl tools/pd-ctl/main.go
+else
+	go build -gcflags '$(GCFLAGS)' -ldflags '$(LDFLAGS)' -o $(CD_BIN_PATH)/pd-ctl-$(GOARCH) tools/pd-ctl/main.go
+endif
+
+pd-recover-cd:
+ifeq ($(CD_BIN_PATH),)
+	go build -gcflags '$(GCFLAGS)' -ldflags '$(LDFLAGS)' -o $(BUILD_BIN_PATH)/pd-recover tools/pd-recover/main.go
+else
+	go build -gcflags '$(GCFLAGS)' -ldflags '$(LDFLAGS)' -o $(CD_BIN_PATH)/pd-recover-$(GOARCH) tools/pd-recover/main.go
+endif
+
 # Tools
 
 pd-ctl:
