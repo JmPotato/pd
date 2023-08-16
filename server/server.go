@@ -429,7 +429,7 @@ func (s *Server) startServer(ctx context.Context) error {
 		return err
 	}
 
-	s.gcSafePointManager = gc.NewSafePointManager(s.storage, s.cfg.PDServerCfg)
+	s.gcSafePointManager = gc.NewSafePointManager(s.storage, s.cfg.PDServerCfg, s.persistOptions)
 	s.basicCluster = core.NewBasicCluster()
 	s.cluster = cluster.NewRaftCluster(ctx, s.clusterID, syncer.NewRegionSyncer(s), s.client, s.httpClient)
 	keyspaceIDAllocator := id.NewAllocator(&id.AllocatorParams{

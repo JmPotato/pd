@@ -31,7 +31,7 @@ func newGCStorage() endpoint.GCSafePointStorage {
 }
 
 func TestGCSafePointUpdateSequentially(t *testing.T) {
-	gcSafePointManager := NewSafePointManager(newGCStorage(), config.PDServerConfig{})
+	gcSafePointManager := NewSafePointManager(newGCStorage(), config.PDServerConfig{}, config.NewPersistOptions(config.NewConfig()))
 	re := require.New(t)
 	curSafePoint := uint64(0)
 	// update gc safePoint with asc value.
@@ -60,7 +60,7 @@ func TestGCSafePointUpdateSequentially(t *testing.T) {
 }
 
 func TestGCSafePointUpdateCurrently(t *testing.T) {
-	gcSafePointManager := NewSafePointManager(newGCStorage(), config.PDServerConfig{})
+	gcSafePointManager := NewSafePointManager(newGCStorage(), config.PDServerConfig{}, config.NewPersistOptions(config.NewConfig()))
 	maxSafePoint := uint64(1000)
 	wg := sync.WaitGroup{}
 	re := require.New(t)
@@ -84,7 +84,7 @@ func TestGCSafePointUpdateCurrently(t *testing.T) {
 
 func TestServiceGCSafePointUpdate(t *testing.T) {
 	re := require.New(t)
-	manager := NewSafePointManager(newGCStorage(), config.PDServerConfig{})
+	manager := NewSafePointManager(newGCStorage(), config.PDServerConfig{}, config.NewPersistOptions(config.NewConfig()))
 	gcworkerServiceID := "gc_worker"
 	cdcServiceID := "cdc"
 	brServiceID := "br"

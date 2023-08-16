@@ -28,15 +28,16 @@ import (
 
 // SafePointManager is the manager for safePoint of GC and services.
 type SafePointManager struct {
-	gcLock        syncutil.Mutex
-	serviceGCLock syncutil.Mutex
-	store         endpoint.GCSafePointStorage
-	cfg           config.PDServerConfig
+	gcLock          syncutil.Mutex
+	serviceGCLock   syncutil.Mutex
+	store           endpoint.GCSafePointStorage
+	cfg             config.PDServerConfig
+	persist_options *config.PersistOptions
 }
 
 // NewSafePointManager creates a SafePointManager of GC and services.
-func NewSafePointManager(store endpoint.GCSafePointStorage, cfg config.PDServerConfig) *SafePointManager {
-	manager := &SafePointManager{store: store, cfg: cfg}
+func NewSafePointManager(store endpoint.GCSafePointStorage, cfg config.PDServerConfig, persist_options *config.PersistOptions) *SafePointManager {
+	manager := &SafePointManager{store: store, cfg: cfg, persist_options: persist_options}
 	// load the gc safepoint from storage to initialize `pd_gc_gc_safepoint` metric.
 	gcSafepoint, err := manager.LoadGCSafePoint()
 	if err != nil {
@@ -55,7 +56,7 @@ func (manager *SafePointManager) LoadGCSafePoint() (uint64, error) {
 // UpdateGCSafePoint updates the safepoint if it is greater than the previous one
 // it returns the old safepoint in the storage.
 func (manager *SafePointManager) UpdateGCSafePoint(newSafePoint uint64) (oldSafePoint uint64, err error) {
-	if manager.cfg.BlockSafePointV1 && newSafePoint > 0 {
+	if manager.persist_options.GetBlockSafePointV1() && newSafePoint > 0 {
 		oldSafePoint = 0
 		err = errors.Errorf("Don't allow update gc safe point v1.")
 		return
@@ -82,7 +83,7 @@ func (manager *SafePointManager) UpdateGCSafePoint(newSafePoint uint64) (oldSafe
 func (manager *SafePointManager) UpdateServiceGCSafePoint(serviceID string, newSafePoint uint64, ttl int64, now time.Time) (minServiceSafePoint *endpoint.ServiceSafePoint, updated bool, err error) {
 
 	// Global service safe point `endpoint.NativeBRServiceID` can always to be updated.
-	if manager.cfg.BlockSafePointV1 && serviceID != endpoint.NativeBRServiceID {
+	if manager.persist_options.GetBlockSafePointV1() && serviceID != endpoint.NativeBRServiceID {
 		return nil, false, errors.Errorf("Don't allow update service safe point v1.")
 	}
 

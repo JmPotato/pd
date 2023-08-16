@@ -247,6 +247,7 @@ const (
 	minServerMemoryLimitGCTrigger     = 0.5
 	maxServerMemoryLimitGCTrigger     = 0.99
 	defaultEnableGOGCTuner            = false
+	defaultBlockSafePointV1           = false
 	defaultGCTunerThreshold           = 0.6
 	minGCTunerThreshold               = 0
 	maxGCTunerThreshold               = 0.9
@@ -1105,7 +1106,7 @@ type PDServerConfig struct {
 	// GCTunerThreshold is the threshold of GC tuner.
 	GCTunerThreshold float64 `toml:"gc-tuner-threshold" json:"gc-tuner-threshold"`
 
-	BlockSafePointV1 bool `toml:"block-safe-point-v1" json:"block-safe-point-v1"`
+	BlockSafePointV1 bool `toml:"block-safe-point-v1" json:"block-safe-point-v1,string"`
 }
 
 func (c *PDServerConfig) adjust(meta *configutil.ConfigMetaData) error {
@@ -1149,6 +1150,9 @@ func (c *PDServerConfig) adjust(meta *configutil.ConfigMetaData) error {
 	}
 	if !meta.IsDefined("enable-gogc-tuner") {
 		c.EnableGOGCTuner = defaultEnableGOGCTuner
+	}
+	if !meta.IsDefined("block-safe-point-v1") {
+		c.BlockSafePointV1 = defaultBlockSafePointV1
 	}
 	if !meta.IsDefined("gc-tuner-threshold") {
 		configutil.AdjustFloat64(&c.GCTunerThreshold, defaultGCTunerThreshold)
