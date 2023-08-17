@@ -569,7 +569,7 @@ func (o *PersistOptions) GetEnableGOGCTuner() bool {
 	return o.GetPDServerConfig().EnableGOGCTuner
 }
 
-// GetEnableGOGCTuner gets the EnableGOGCTuner config.
+// GetBlockSafePointV1 gets the BlockSafePointV1 config.
 func (o *PersistOptions) GetBlockSafePointV1() bool {
 	return o.GetPDServerConfig().BlockSafePointV1
 }

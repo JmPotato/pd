@@ -248,6 +248,7 @@ const (
 	maxServerMemoryLimitGCTrigger     = 0.99
 	defaultEnableGOGCTuner            = false
 	defaultBlockSafePointV1           = false
+	defaultEnableGlobalSafePointV2    = false
 	defaultGCTunerThreshold           = 0.6
 	minGCTunerThreshold               = 0
 	maxGCTunerThreshold               = 0.9
@@ -1105,7 +1106,7 @@ type PDServerConfig struct {
 	EnableGOGCTuner bool `toml:"enable-gogc-tuner" json:"enable-gogc-tuner,string"`
 	// GCTunerThreshold is the threshold of GC tuner.
 	GCTunerThreshold float64 `toml:"gc-tuner-threshold" json:"gc-tuner-threshold"`
-
+	// BlockSafePointV1 is to block update safe point v1.
 	BlockSafePointV1 bool `toml:"block-safe-point-v1" json:"block-safe-point-v1,string"`
 }
 
@@ -1447,6 +1448,8 @@ type KeyspaceConfig struct {
 	WaitRegionSplitTimeout typeutil.Duration `toml:"wait-region-split-timeout" json:"wait-region-split-timeout"`
 	// CheckRegionSplitInterval indicates the interval to check whether the region split is complete
 	CheckRegionSplitInterval typeutil.Duration `toml:"check-region-split-interval" json:"check-region-split-interval"`
+	// EnableGlobalSafePointV2 is to set new keyspace safe point version to v2.
+	EnableGlobalSafePointV2 bool `toml:"enable-global-safe-point-v2" json:"enable-global-safe-point-v2,string"`
 }
 
 // Validate checks if keyspace config falls within acceptable range.
@@ -1470,6 +1473,9 @@ func (c *KeyspaceConfig) adjust(meta *configutil.ConfigMetaData) {
 	}
 	if !meta.IsDefined("check-region-split-interval") {
 		c.CheckRegionSplitInterval = typeutil.NewDuration(defaultCheckRegionSplitInterval)
+	}
+	if !meta.IsDefined("enable-global-safe-point-v2") {
+		c.EnableGlobalSafePointV2 = defaultEnableGlobalSafePointV2
 	}
 }
 
@@ -1499,4 +1505,14 @@ func (c *KeyspaceConfig) GetWaitRegionSplitTimeout() time.Duration {
 // GetCheckRegionSplitInterval returns the interval to check whether the region split is complete.
 func (c *KeyspaceConfig) GetCheckRegionSplitInterval() time.Duration {
 	return c.CheckRegionSplitInterval.Duration
+}
+
+// GetEnableGlobalSafePointV2 returns whether to enable global safe point v2.
+func (c *KeyspaceConfig) GetEnableGlobalSafePointV2() bool {
+	return c.EnableGlobalSafePointV2
+}
+
+// SetEnableGlobalSafePointV2 set whether to enable global safe point v2.
+func (c *KeyspaceConfig) SetEnableGlobalSafePointV2(isEnable bool) {
+	c.EnableGlobalSafePointV2 = isEnable
 }

@@ -39,16 +39,20 @@ const (
 	// GCWorkerServiceSafePointID is the service id of GC worker.
 	GCWorkerServiceSafePointID = "gc_worker"
 	// NativeBRServiceID is CSE native br service id.
-	NativeBRServiceID     = "native_br"
-	minResolvedTS         = "min_resolved_ts"
-	externalTimeStamp     = "external_timestamp"
-	keyspacePrefix        = "keyspaces"
-	keyspaceMetaInfix     = "meta"
-	keyspaceIDInfix       = "id"
-	keyspaceAllocID       = "alloc_id"
-	gcSafePointInfix      = "gc_safe_point"
-	serviceSafePointInfix = "service_safe_point"
-	regionPathPrefix      = "raft/r"
+	NativeBRServiceID                   = "native_br"
+	minResolvedTS                       = "min_resolved_ts"
+	externalTimeStamp                   = "external_timestamp"
+	keyspacePrefix                      = "keyspaces"
+	keyspaceMetaInfix                   = "meta"
+	keyspaceGlobalInfix                 = "global"
+	keyspaceGlobalSafePointVersionInfix = "safe_point_version"
+	KeyspaceGlobalSafePointVersionV1    = "v1"
+	KeyspaceGlobalSafePointVersionV2    = "v2"
+	keyspaceIDInfix                     = "id"
+	keyspaceAllocID                     = "alloc_id"
+	gcSafePointInfix                    = "gc_safe_point"
+	serviceSafePointInfix               = "service_safe_point"
+	regionPathPrefix                    = "raft/r"
 	// resource group storage endpoint has prefix `resource_group`
 	resourceGroupSettingsPath = "settings"
 	resourceGroupStatesPath   = "states"
@@ -207,6 +211,16 @@ func KeyspaceMetaPrefix() string {
 func KeyspaceMetaPath(spaceID uint32) string {
 	idStr := EncodeKeyspaceID(spaceID)
 	return path.Join(KeyspaceMetaPrefix(), idStr)
+}
+
+func KeyspaceGlobalSetPath() string {
+	return path.Join(keyspacePrefix, keyspaceGlobalInfix) + "/"
+}
+
+// KeyspaceGlobalSafePointVersionPath returns global safe point version path.
+// Path: keyspaces/global/safe_point_version
+func KeyspaceGlobalSafePointVersionPath() string {
+	return path.Join(KeyspaceGlobalSetPath(), "/", keyspaceGlobalSafePointVersionInfix)
 }
 
 // KeyspaceIDPath returns the path to keyspace id from the given name.

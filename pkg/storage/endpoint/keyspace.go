@@ -43,6 +43,8 @@ type KeyspaceStorage interface {
 	// LoadRangeKeyspace loads no more than limit keyspaces starting at startID.
 	LoadRangeKeyspace(txn kv.Txn, startID uint32, limit int) ([]*keyspacepb.KeyspaceMeta, error)
 	RunInTxn(ctx context.Context, f func(txn kv.Txn) error) error
+	GetGlobalSavePointVersion(txn kv.Txn) (string, error)
+	SaveGlobalSavePointVersion(txn kv.Txn, safePointVersion string) error
 }
 
 var _ KeyspaceStorage = (*StorageEndpoint)(nil)
@@ -123,4 +125,17 @@ func (se *StorageEndpoint) LoadRangeKeyspace(txn kv.Txn, startID uint32, limit i
 		keyspaces = append(keyspaces, keyspace)
 	}
 	return keyspaces, nil
+}
+
+// GetGlobalSavePointVersion return global keyspace safe point version.
+func (se *StorageEndpoint) GetGlobalSavePointVersion(txn kv.Txn) (string, error) {
+	confPath := KeyspaceGlobalSafePointVersionPath()
+	res, err := txn.Load(confPath)
+	return res, err
+}
+
+// SaveGlobalSavePointVersion save global keyspace safe point version.
+func (se *StorageEndpoint) SaveGlobalSavePointVersion(txn kv.Txn, safePointVersion string) error {
+	confPath := KeyspaceGlobalSafePointVersionPath()
+	return txn.Save(confPath, safePointVersion)
 }
