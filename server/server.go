@@ -227,10 +227,10 @@ type HandlerBuilder func(context.Context, *Server) (http.Handler, apiutil.APISer
 // CreateServer creates the UNINITIALIZED pd server with given configuration.
 func CreateServer(ctx context.Context, cfg *config.Config, services []string, legacyServiceBuilders ...HandlerBuilder) (*Server, error) {
 	var mode string
-	if len(services) == 0 || services[0] == "pd" {
-		mode = PDMode
-	} else {
+	if len(services) != 0 {
 		mode = APIServiceMode
+	} else {
+		mode = PDMode
 	}
 	log.Info(fmt.Sprintf("%s config", mode), zap.Reflect("config", cfg))
 	rand.New(rand.NewSource(time.Now().UnixNano()))
