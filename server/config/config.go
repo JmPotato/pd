@@ -240,18 +240,18 @@ const (
 
 	defaultMaxMovableHotPeerSize = int64(512)
 
-	defaultServerMemoryLimit          = 0
-	minServerMemoryLimit              = 0
-	maxServerMemoryLimit              = 0.99
-	defaultServerMemoryLimitGCTrigger = 0.7
-	minServerMemoryLimitGCTrigger     = 0.5
-	maxServerMemoryLimitGCTrigger     = 0.99
-	defaultEnableGOGCTuner            = false
-	defaultBlockSafePointV1           = false
-	defaultEnableGlobalSafePointV2    = false
-	defaultGCTunerThreshold           = 0.6
-	minGCTunerThreshold               = 0
-	maxGCTunerThreshold               = 0.9
+	defaultServerMemoryLimit            = 0
+	minServerMemoryLimit                = 0
+	maxServerMemoryLimit                = 0.99
+	defaultServerMemoryLimitGCTrigger   = 0.7
+	minServerMemoryLimitGCTrigger       = 0.5
+	maxServerMemoryLimitGCTrigger       = 0.99
+	defaultEnableGOGCTuner              = false
+	defaultEnableBlockUpdateSafePointV1 = false
+	defaultEnableGlobalSafePointV2      = false
+	defaultGCTunerThreshold             = 0.6
+	minGCTunerThreshold                 = 0
+	maxGCTunerThreshold                 = 0.9
 
 	defaultWaitRegionSplitTimeout   = 30 * time.Second
 	defaultCheckRegionSplitInterval = 50 * time.Millisecond
@@ -1106,8 +1106,8 @@ type PDServerConfig struct {
 	EnableGOGCTuner bool `toml:"enable-gogc-tuner" json:"enable-gogc-tuner,string"`
 	// GCTunerThreshold is the threshold of GC tuner.
 	GCTunerThreshold float64 `toml:"gc-tuner-threshold" json:"gc-tuner-threshold"`
-	// BlockSafePointV1 is to block update safe point v1.
-	BlockSafePointV1 bool `toml:"block-safe-point-v1" json:"block-safe-point-v1,string"`
+	// EnableBlockUpdateSafePointV1 is to block update safe point v1.
+	EnableBlockUpdateSafePointV1 bool `toml:"enable-block-update-safe-point-v1" json:"enable-block-update-safe-point-v1,string"`
 }
 
 func (c *PDServerConfig) adjust(meta *configutil.ConfigMetaData) error {
@@ -1152,8 +1152,8 @@ func (c *PDServerConfig) adjust(meta *configutil.ConfigMetaData) error {
 	if !meta.IsDefined("enable-gogc-tuner") {
 		c.EnableGOGCTuner = defaultEnableGOGCTuner
 	}
-	if !meta.IsDefined("block-safe-point-v1") {
-		c.BlockSafePointV1 = defaultBlockSafePointV1
+	if !meta.IsDefined("enable-block-update-safe-point-v1") {
+		c.EnableBlockUpdateSafePointV1 = defaultEnableBlockUpdateSafePointV1
 	}
 	if !meta.IsDefined("gc-tuner-threshold") {
 		configutil.AdjustFloat64(&c.GCTunerThreshold, defaultGCTunerThreshold)

@@ -569,9 +569,9 @@ func (o *PersistOptions) GetEnableGOGCTuner() bool {
 	return o.GetPDServerConfig().EnableGOGCTuner
 }
 
-// GetBlockSafePointV1 gets the BlockSafePointV1 config.
-func (o *PersistOptions) GetBlockSafePointV1() bool {
-	return o.GetPDServerConfig().BlockSafePointV1
+// IsBlockUpdateSafePointV1Enabled gets the EnableBlockUpdateSafePointV1 config.
+func (o *PersistOptions) IsBlockUpdateSafePointV1Enabled() bool {
+	return o.GetPDServerConfig().EnableBlockUpdateSafePointV1
 }
 
 // GetGCTunerThreshold gets the GC tuner threshold.

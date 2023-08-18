@@ -56,7 +56,7 @@ func (manager *SafePointManager) LoadGCSafePoint() (uint64, error) {
 // UpdateGCSafePoint updates the safepoint if it is greater than the previous one
 // it returns the old safepoint in the storage.
 func (manager *SafePointManager) UpdateGCSafePoint(newSafePoint uint64) (oldSafePoint uint64, err error) {
-	if manager.persist_options.GetBlockSafePointV1() && newSafePoint > 0 {
+	if manager.persist_options.IsBlockUpdateSafePointV1Enabled() && newSafePoint > 0 {
 		oldSafePoint = 0
 		err = errors.Errorf("Don't allow update gc safe point v1.")
 		return
@@ -83,7 +83,7 @@ func (manager *SafePointManager) UpdateGCSafePoint(newSafePoint uint64) (oldSafe
 func (manager *SafePointManager) UpdateServiceGCSafePoint(serviceID string, newSafePoint uint64, ttl int64, now time.Time) (minServiceSafePoint *endpoint.ServiceSafePoint, updated bool, err error) {
 
 	// Global service safe point `endpoint.NativeBRServiceID` can always to be updated.
-	if manager.persist_options.GetBlockSafePointV1() && serviceID != endpoint.NativeBRServiceID {
+	if manager.persist_options.IsBlockUpdateSafePointV1Enabled() && serviceID != endpoint.NativeBRServiceID {
 		return nil, false, errors.Errorf("Don't allow update service safe point v1.")
 	}
 
