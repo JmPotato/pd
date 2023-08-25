@@ -19,9 +19,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"net/url"
+	"time"
 
 	"github.com/pingcap/log"
 	"github.com/tikv/pd/pkg/errs"
+	"github.com/tikv/pd/pkg/utils/logutil"
 	"go.etcd.io/etcd/pkg/transport"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -159,4 +161,20 @@ func GetForwardedHost(ctx context.Context) string {
 		return t[0]
 	}
 	return ""
+}
+
+// CheckStream checks stream status, if stream is not created successfully in time, cancel context.
+// TODO: If goroutine here timeout when tso stream created successfully, we need to handle it correctly.
+func CheckStream(ctx context.Context, cancel context.CancelFunc, done chan struct{}) {
+	defer logutil.LogPanic()
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+		cancel()
+	case <-ctx.Done():
+	}
+	<-done
 }
