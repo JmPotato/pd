@@ -109,7 +109,7 @@ func (manager *SafePointV2Manager) checkKeyspace(keyspaceID uint32, updateReques
 		return nil
 	})
 	if err != nil {
-		log.Warn("check keyspace failed",
+		log.Debug("check keyspace failed",
 			zap.Uint32("keyspace-id", keyspaceID),
 			zap.Error(err),
 		)
