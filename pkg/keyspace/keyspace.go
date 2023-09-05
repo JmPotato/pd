@@ -124,6 +124,7 @@ func NewKeyspaceManager(ctx context.Context, store endpoint.KeyspaceStorage, clu
 	return manager
 }
 
+// SetGlobalSafePointV2 is used to set safe point version by config.
 func (manager *Manager) SetGlobalSafePointV2() error {
 	return manager.store.RunInTxn(manager.ctx, func(txn kv.Txn) error {
 		globalSafePointVersion, err := manager.store.GetGlobalSavePointVersion(txn)
@@ -327,6 +328,12 @@ func (manager *Manager) saveNewKeyspace(keyspace *keyspacepb.KeyspaceMeta) error
 		}
 		if loadedMeta != nil {
 			return ErrKeyspaceExists
+		}
+		if manager.config.GetEnableGlobalSafePointV2() {
+			err = manager.store.InitKeyspaceGCSafePointV2(txn, keyspace.Id)
+			if err != nil {
+				return err
+			}
 		}
 		return manager.store.SaveKeyspaceMeta(txn, keyspace)
 	})

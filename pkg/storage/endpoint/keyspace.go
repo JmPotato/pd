@@ -16,6 +16,7 @@ package endpoint
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 
 	"github.com/gogo/protobuf/proto"
@@ -45,6 +46,7 @@ type KeyspaceStorage interface {
 	RunInTxn(ctx context.Context, f func(txn kv.Txn) error) error
 	GetGlobalSavePointVersion(txn kv.Txn) (string, error)
 	SaveGlobalSavePointVersion(txn kv.Txn, safePointVersion string) error
+	InitKeyspaceGCSafePointV2(txn kv.Txn, id uint32) error
 }
 
 var _ KeyspaceStorage = (*StorageEndpoint)(nil)
@@ -138,4 +140,17 @@ func (se *StorageEndpoint) GetGlobalSavePointVersion(txn kv.Txn) (string, error)
 func (se *StorageEndpoint) SaveGlobalSavePointVersion(txn kv.Txn, safePointVersion string) error {
 	confPath := KeyspaceGlobalSafePointVersionPath()
 	return txn.Save(confPath, safePointVersion)
+}
+
+func (se *StorageEndpoint) InitKeyspaceGCSafePointV2(txn kv.Txn, id uint32) error {
+	gcV2 := &GCSafePointV2{
+		KeyspaceID: id,
+		SafePoint:  0,
+	}
+	key := GCSafePointV2Path(gcV2.KeyspaceID)
+	value, err := json.Marshal(gcV2)
+	if err != nil {
+		return errs.ErrJSONMarshal.Wrap(err).GenWithStackByCause()
+	}
+	return txn.Save(key, string(value))
 }
