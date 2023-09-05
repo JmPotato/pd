@@ -279,6 +279,14 @@ func (am *AllocatorManager) getGroupID() uint32 {
 	return am.kgID
 }
 
+// getGroupIDStr returns the keyspace group ID of the allocator manager in string format.
+func (am *AllocatorManager) getGroupIDStr() string {
+	if am == nil {
+		return "0"
+	}
+	return strconv.FormatUint(uint64(am.kgID), 10)
+}
+
 // GetTimestampPath returns the timestamp path in etcd for the given DCLocation.
 func (am *AllocatorManager) GetTimestampPath(dcLocation string) string {
 	if am == nil {
@@ -1186,6 +1194,9 @@ func (am *AllocatorManager) getAllocatorGroup(dcLocation string) (*allocatorGrou
 func (am *AllocatorManager) GetAllocator(dcLocation string) (Allocator, error) {
 	am.mu.RLock()
 	defer am.mu.RUnlock()
+	if len(dcLocation) == 0 {
+		dcLocation = GlobalDCLocation
+	}
 	allocatorGroup, exist := am.mu.allocatorGroups[dcLocation]
 	if !exist {
 		return nil, errs.ErrGetAllocator.FastGenByArgs(fmt.Sprintf("%s allocator not found", dcLocation))

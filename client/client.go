@@ -251,14 +251,6 @@ func WithMaxErrorRetry(count int) ClientOption {
 	}
 }
 
-// WithAllowTSOFallback configures the client with `allowTSOFallback` option.
-// NOTICE: This should only be used for testing.
-func WithAllowTSOFallback() ClientOption {
-	return func(c *client) {
-		c.option.allowTSOFallback = true
-	}
-}
-
 var _ Client = (*client)(nil)
 
 // serviceModeKeeper is for service mode switching.

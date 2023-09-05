@@ -269,13 +269,6 @@ func (c *RaftCluster) Start(s Server) error {
 		return nil
 	}
 
-	if s.IsAPIServiceMode() {
-		err = c.keyspaceGroupManager.Bootstrap(c.ctx)
-		if err != nil {
-			return err
-		}
-	}
-
 	c.ruleManager = placement.NewRuleManager(c.storage, c, c.GetOpts())
 	if c.opt.IsPlacementRulesEnabled() {
 		err = c.ruleManager.Initialize(c.opt.GetMaxReplicas(), c.opt.GetLocationLabels())
@@ -299,6 +292,15 @@ func (c *RaftCluster) Start(s Server) error {
 	c.externalTS, err = c.storage.LoadExternalTS()
 	if err != nil {
 		log.Error("load external timestamp meets error", zap.Error(err))
+	}
+
+	// bootstrap keyspace group manager after starting other parts successfully.
+	// This order avoids a stuck goroutine in keyspaceGroupManager when it fails to create raftcluster.
+	if s.IsAPIServiceMode() {
+		err = c.keyspaceGroupManager.Bootstrap(c.ctx)
+		if err != nil {
+			return err
+		}
 	}
 
 	c.wg.Add(10)

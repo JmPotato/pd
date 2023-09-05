@@ -72,15 +72,24 @@ type state struct {
 	// keyspaceLookupTable is a map from keyspace to the keyspace group to which it belongs.
 	keyspaceLookupTable map[uint32]uint32
 	// splittingGroups is the cache of splitting keyspace group related information.
-	splittingGroups map[uint32]struct{}
+	// The key is the keyspace group ID, and the value is the time when the keyspace group
+	// is created as the split target. Once the split is finished, the keyspace group will
+	// be removed from this map.
+	splittingGroups map[uint32]time.Time
 	// deletedGroups is the cache of deleted keyspace group related information.
+	// Being merged will cause the group to be added to this map and finally be deleted after the merge.
 	deletedGroups map[uint32]struct{}
+	// requestedGroups is the cache of requested keyspace group related information.
+	// Once a group receives its first TSO request and pass the certain check, it will be added to this map.
+	// Being merged will cause the group to be removed from this map eventually if the merge is successful.
+	requestedGroups map[uint32]struct{}
 }
 
 func (s *state) initialize() {
 	s.keyspaceLookupTable = make(map[uint32]uint32)
-	s.splittingGroups = make(map[uint32]struct{})
+	s.splittingGroups = make(map[uint32]time.Time)
 	s.deletedGroups = make(map[uint32]struct{})
+	s.requestedGroups = make(map[uint32]struct{})
 }
 
 func (s *state) deInitialize() {
@@ -144,7 +153,44 @@ func (s *state) getDeletedGroupNum() int {
 	return len(s.deletedGroups)
 }
 
-func (s *state) checkTSOSplit(
+// cleanKeyspaceGroup cleans the given keyspace group from the state.
+// NOTICE: currently the only legal way to delete a keyspace group is
+// to merge it into another one. This function is used to clean up the
+// remaining info after the merge has been finished.
+func (s *state) cleanKeyspaceGroup(groupID uint32) {
+	s.Lock()
+	defer s.Unlock()
+	delete(s.deletedGroups, groupID)
+	delete(s.requestedGroups, groupID)
+}
+
+// markGroupRequested checks if the given keyspace group has been requested and should be marked.
+// If yes, it will do nothing and return nil directly.
+// If not, it will try to mark the keyspace group as requested inside a critical section, which
+// will call the checker passed in to check if the keyspace group is qualified to be marked as requested.
+// Any error encountered during the check will be returned to the caller.
+func (s *state) markGroupRequested(groupID uint32, checker func() error) error {
+	// Fast path to check if the keyspace group has been marked as requested.
+	s.RLock()
+	_, ok := s.requestedGroups[groupID]
+	s.RUnlock()
+	if ok {
+		return nil
+	}
+	s.Lock()
+	defer s.Unlock()
+	// Double check if the keyspace group has been marked as requested.
+	if _, ok := s.requestedGroups[groupID]; ok {
+		return nil
+	}
+	if err := checker(); err != nil {
+		return err
+	}
+	s.requestedGroups[groupID] = struct{}{}
+	return nil
+}
+
+func (s *state) checkGroupSplit(
 	targetGroupID uint32,
 ) (splitTargetAM, splitSourceAM *AllocatorManager, err error) {
 	s.RLock()
@@ -166,7 +212,7 @@ func (s *state) checkTSOSplit(
 
 // Reject any request if the keyspace group is in merging state,
 // we need to wait for the merging checker to finish the TSO merging.
-func (s *state) checkTSOMerge(
+func (s *state) checkGroupMerge(
 	groupID uint32,
 ) error {
 	s.RLock()
@@ -341,6 +387,9 @@ type KeyspaceGroupManager struct {
 	serviceRegistryMap map[string]string
 	// tsoNodesWatcher is the watcher for the registered tso servers.
 	tsoNodesWatcher *etcdutil.LoopWatcher
+
+	// pre-initialized metrics
+	metrics *keyspaceGroupMetrics
 }
 
 // NewKeyspaceGroupManager creates a new Keyspace Group Manager.
@@ -376,6 +425,7 @@ func NewKeyspaceGroupManager(
 		cfg:                          cfg,
 		groupUpdateRetryList:         make(map[uint32]*endpoint.KeyspaceGroup),
 		serviceRegistryMap:           make(map[string]string),
+		metrics:                      newKeyspaceGroupMetrics(),
 	}
 	kgm.legacySvcStorage = endpoint.NewStorageEndpoint(
 		kv.NewEtcdKVBase(kgm.etcdClient, kgm.legacySvcRootPath), nil)
@@ -665,12 +715,15 @@ func (kgm *KeyspaceGroupManager) updateKeyspaceGroup(group *endpoint.KeyspaceGro
 		kgm.mergeCheckerCancelMap.Store(group.ID, cancel)
 		kgm.wg.Add(1)
 		go kgm.mergingChecker(ctx, group.ID, group.MergeState.MergeList)
+		kgm.metrics.mergeTargetGauge.Inc()
+		kgm.metrics.mergeSourceGauge.Add(float64(len(group.MergeState.MergeList)))
 	}
 	// If the merge state has been finished, cancel its merging checker.
 	if oldGroup.IsMergeTarget() && !group.IsMergeTarget() {
 		if cancel, loaded := kgm.mergeCheckerCancelMap.LoadAndDelete(group.ID); loaded && cancel != nil {
 			cancel.(context.CancelFunc)()
 		}
+		kgm.metrics.mergeTargetGauge.Dec()
 	}
 
 	// If this host is already assigned a replica of this keyspace group, i.e., the election member
@@ -738,7 +791,8 @@ func (kgm *KeyspaceGroupManager) updateKeyspaceGroup(group *endpoint.KeyspaceGro
 	kgm.ams[group.ID] = am
 	// If the group is the split target, add it to the splitting group map.
 	if group.IsSplitTarget() {
-		kgm.splittingGroups[group.ID] = struct{}{}
+		kgm.splittingGroups[group.ID] = time.Now()
+		kgm.metrics.splitTargetGauge.Inc()
 	}
 	kgm.Unlock()
 }
@@ -864,10 +918,24 @@ func (kgm *KeyspaceGroupManager) updateKeyspaceGroupMembership(
 			}
 		}
 	}
-	// Check if the split is completed.
-	if oldGroup != nil && oldGroup.IsSplitTarget() && !newGroup.IsSplitting() {
-		kgm.ams[groupID].GetMember().(*member.Participant).SetCampaignChecker(nil)
-		delete(kgm.splittingGroups, groupID)
+	// Check the split state.
+	if oldGroup != nil {
+		// SplitTarget -> !Splitting
+		if oldGroup.IsSplitTarget() && !newGroup.IsSplitting() {
+			kgm.ams[groupID].GetMember().(*member.Participant).SetCampaignChecker(nil)
+			splitTime := kgm.splittingGroups[groupID]
+			delete(kgm.splittingGroups, groupID)
+			kgm.metrics.splitTargetGauge.Dec()
+			kgm.metrics.splitDuration.Observe(time.Since(splitTime).Seconds())
+		}
+		// SplitSource -> !SplitSource
+		if oldGroup.IsSplitSource() && !newGroup.IsSplitting() {
+			kgm.metrics.splitSourceGauge.Dec()
+		}
+		// !Splitting -> SplitSource
+		if !oldGroup.IsSplitting() && newGroup.IsSplitSource() {
+			kgm.metrics.splitSourceGauge.Inc()
+		}
 	}
 	kgm.kgs[groupID] = newGroup
 }
@@ -989,6 +1057,7 @@ func (kgm *KeyspaceGroupManager) GetKeyspaceGroups() map[uint32]*endpoint.Keyspa
 
 // HandleTSORequest forwards TSO allocation requests to correct TSO Allocators of the given keyspace group.
 func (kgm *KeyspaceGroupManager) HandleTSORequest(
+	ctx context.Context,
 	keyspaceID, keyspaceGroupID uint32,
 	dcLocation string, count uint32,
 ) (ts pdpb.Timestamp, curKeyspaceGroupID uint32, err error) {
@@ -1003,7 +1072,22 @@ func (kgm *KeyspaceGroupManager) HandleTSORequest(
 	if err != nil {
 		return pdpb.Timestamp{}, curKeyspaceGroupID, err
 	}
-	err = kgm.state.checkTSOMerge(curKeyspaceGroupID)
+	err = kgm.state.checkGroupMerge(curKeyspaceGroupID)
+	if err != nil {
+		return pdpb.Timestamp{}, curKeyspaceGroupID, err
+	}
+	// If this is the first time to request the keyspace group, we need to sync the
+	// timestamp one more time before serving the TSO request to make sure that the
+	// TSO is the latest one from the storage, which could prevent the potential
+	// fallback caused by the rolling update of the mixed old PD and TSO service deployment.
+	err = kgm.markGroupRequested(curKeyspaceGroupID, func() error {
+		allocator, err := am.GetAllocator(dcLocation)
+		if err != nil {
+			return err
+		}
+		// TODO: support the Local TSO Allocator.
+		return allocator.Initialize(0)
+	})
 	if err != nil {
 		return pdpb.Timestamp{}, curKeyspaceGroupID, err
 	}
@@ -1078,7 +1162,7 @@ func (kgm *KeyspaceGroupManager) checkTSOSplit(
 	keyspaceGroupID uint32,
 	dcLocation string,
 ) error {
-	splitTargetAM, splitSourceAM, err := kgm.state.checkTSOSplit(keyspaceGroupID)
+	splitTargetAM, splitSourceAM, err := kgm.state.checkGroupSplit(keyspaceGroupID)
 	if err != nil || splitTargetAM == nil {
 		return err
 	}
@@ -1131,6 +1215,7 @@ const keyspaceGroupsAPIPrefix = "/pd/api/v2/tso/keyspace-groups"
 
 // Put the code below into the critical section to prevent from sending too many HTTP requests.
 func (kgm *KeyspaceGroupManager) finishSplitKeyspaceGroup(id uint32) error {
+	start := time.Now()
 	kgm.Lock()
 	defer kgm.Unlock()
 	// Check if the keyspace group is in split state.
@@ -1142,6 +1227,7 @@ func (kgm *KeyspaceGroupManager) finishSplitKeyspaceGroup(id uint32) error {
 	if kgm.httpClient == nil {
 		return nil
 	}
+	startRequest := time.Now()
 	statusCode, err := apiutil.DoDelete(
 		kgm.httpClient,
 		kgm.cfg.GeBackendEndpoints()+keyspaceGroupsAPIPrefix+fmt.Sprintf("/%d/split", id))
@@ -1154,6 +1240,7 @@ func (kgm *KeyspaceGroupManager) finishSplitKeyspaceGroup(id uint32) error {
 			zap.Int("status-code", statusCode))
 		return errs.ErrSendRequest.FastGenByArgs()
 	}
+	kgm.metrics.finishSplitSendDuration.Observe(time.Since(startRequest).Seconds())
 	// Pre-update the split keyspace group's split state in memory.
 	// Note: to avoid data race with state read APIs, we always replace the group in memory as a whole.
 	// For now, we only have scenarios to update split state/merge state, and the other fields are always
@@ -1161,10 +1248,12 @@ func (kgm *KeyspaceGroupManager) finishSplitKeyspaceGroup(id uint32) error {
 	newSplitGroup := *splitGroup
 	newSplitGroup.SplitState = nil
 	kgm.kgs[id] = &newSplitGroup
+	kgm.metrics.finishSplitDuration.Observe(time.Since(start).Seconds())
 	return nil
 }
 
 func (kgm *KeyspaceGroupManager) finishMergeKeyspaceGroup(id uint32) error {
+	start := time.Now()
 	kgm.Lock()
 	defer kgm.Unlock()
 	// Check if the keyspace group is in the merging state.
@@ -1176,6 +1265,7 @@ func (kgm *KeyspaceGroupManager) finishMergeKeyspaceGroup(id uint32) error {
 	if kgm.httpClient == nil {
 		return nil
 	}
+	startRequest := time.Now()
 	statusCode, err := apiutil.DoDelete(
 		kgm.httpClient,
 		kgm.cfg.GeBackendEndpoints()+keyspaceGroupsAPIPrefix+fmt.Sprintf("/%d/merge", id))
@@ -1188,7 +1278,7 @@ func (kgm *KeyspaceGroupManager) finishMergeKeyspaceGroup(id uint32) error {
 			zap.Int("status-code", statusCode))
 		return errs.ErrSendRequest.FastGenByArgs()
 	}
-
+	kgm.metrics.finishMergeSendDuration.Observe(time.Since(startRequest).Seconds())
 	// Pre-update the merge target keyspace group's merge state in memory.
 	// Note: to avoid data race with state read APIs, we always replace the group in memory as a whole.
 	// For now, we only have scenarios to update split state/merge state, and the other fields are always
@@ -1196,12 +1286,14 @@ func (kgm *KeyspaceGroupManager) finishMergeKeyspaceGroup(id uint32) error {
 	newTargetGroup := *mergeTarget
 	newTargetGroup.MergeState = nil
 	kgm.kgs[id] = &newTargetGroup
+	kgm.metrics.finishMergeDuration.Observe(time.Since(start).Seconds())
 	return nil
 }
 
 // mergingChecker is used to check if the keyspace group is in merge state, and if so, it will
 // make sure the newly merged TSO keep consistent with the original ones.
 func (kgm *KeyspaceGroupManager) mergingChecker(ctx context.Context, mergeTargetID uint32, mergeList []uint32) {
+	startTime := time.Now()
 	log.Info("start to merge the keyspace group",
 		zap.String("member", kgm.tsoServiceID.ServiceAddr),
 		zap.Uint32("merge-target-id", mergeTargetID),
@@ -1269,6 +1361,7 @@ func (kgm *KeyspaceGroupManager) mergingChecker(ctx context.Context, mergeTarget
 		if len(mergeMap) > 0 {
 			continue
 		}
+		kgm.metrics.mergeSourceGauge.Add(-float64(len(mergeList)))
 		log.Info("all the keyspace group primaries in the merge list are gone, "+
 			"start to calculate the newly merged TSO",
 			zap.String("member", kgm.tsoServiceID.ServiceAddr),
@@ -1278,7 +1371,7 @@ func (kgm *KeyspaceGroupManager) mergingChecker(ctx context.Context, mergeTarget
 		// calculate the newly merged TSO to make sure it is greater than the original ones.
 		var mergedTS time.Time
 		for _, id := range mergeList {
-			ts, err := kgm.tsoSvcStorage.LoadTimestamp(endpoint.KeyspaceGroupTSPath(id))
+			ts, err := kgm.tsoSvcStorage.LoadTimestamp(endpoint.KeyspaceGroupGlobalTSPath(id))
 			if err != nil {
 				log.Error("failed to load the keyspace group TSO",
 					zap.String("member", kgm.tsoServiceID.ServiceAddr),
@@ -1336,6 +1429,7 @@ func (kgm *KeyspaceGroupManager) mergingChecker(ctx context.Context, mergeTarget
 				zap.Error(err))
 			continue
 		}
+		kgm.metrics.mergeDuration.Observe(time.Since(startTime).Seconds())
 		log.Info("finished merging keyspace group",
 			zap.String("member", kgm.tsoServiceID.ServiceAddr),
 			zap.Uint32("merge-target-id", mergeTargetID),
@@ -1379,7 +1473,7 @@ func (kgm *KeyspaceGroupManager) groupSplitPatroller() {
 				zap.Uint32("keyspace-group-id", groupID),
 				zap.Uint32("keyspace-id", group.Keyspaces[0]))
 			// Request the TSO manually to speed up the split process.
-			_, _, err := kgm.HandleTSORequest(group.Keyspaces[0], groupID, GlobalDCLocation, 1)
+			_, _, err := kgm.HandleTSORequest(kgm.ctx, group.Keyspaces[0], groupID, GlobalDCLocation, 1)
 			if err != nil {
 				log.Warn("failed to request tso for the splitting keyspace group",
 					zap.Uint32("keyspace-group-id", groupID),
@@ -1435,7 +1529,7 @@ func (kgm *KeyspaceGroupManager) deletedGroupCleaner() {
 			// TODO: support the Local TSO Allocator clean up.
 			err := kgm.tsoSvcStorage.DeleteTimestamp(
 				endpoint.TimestampPath(
-					endpoint.KeyspaceGroupTSPath(groupID),
+					endpoint.KeyspaceGroupGlobalTSPath(groupID),
 				),
 			)
 			if err != nil {
@@ -1444,9 +1538,7 @@ func (kgm *KeyspaceGroupManager) deletedGroupCleaner() {
 					zap.Error(err))
 				continue
 			}
-			kgm.Lock()
-			delete(kgm.deletedGroups, groupID)
-			kgm.Unlock()
+			kgm.cleanKeyspaceGroup(groupID)
 			lastDeletedGroupID = groupID
 			lastDeletedGroupNum += 1
 		}
