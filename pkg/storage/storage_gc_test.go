@@ -39,15 +39,15 @@ func testGCSafePoints() []*endpoint.GCSafePointV2 {
 func testServiceSafePoints() []*endpoint.ServiceSafePointV2 {
 	expireAt := time.Now().Add(100 * time.Second).Unix()
 	serviceSafePoints := []*endpoint.ServiceSafePointV2{
-		{KeyspaceID: uint32(1), ServiceID: "service1", ExpiredAt: expireAt, SafePoint: 1},
-		{KeyspaceID: uint32(1), ServiceID: "service2", ExpiredAt: expireAt, SafePoint: 2},
-		{KeyspaceID: uint32(1), ServiceID: "service3", ExpiredAt: expireAt, SafePoint: 3},
-		{KeyspaceID: uint32(2), ServiceID: "service1", ExpiredAt: expireAt, SafePoint: 1},
-		{KeyspaceID: uint32(2), ServiceID: "service2", ExpiredAt: expireAt, SafePoint: 2},
-		{KeyspaceID: uint32(2), ServiceID: "service3", ExpiredAt: expireAt, SafePoint: 3},
-		{KeyspaceID: uint32(3), ServiceID: "service1", ExpiredAt: expireAt, SafePoint: 1},
-		{KeyspaceID: uint32(3), ServiceID: "service2", ExpiredAt: expireAt, SafePoint: 2},
-		{KeyspaceID: uint32(3), ServiceID: "service3", ExpiredAt: expireAt, SafePoint: 3},
+		{KeyspaceID: uint32(1), ServiceID: "service1", ExpiredAt: expireAt, SafePoint: 11},
+		{KeyspaceID: uint32(1), ServiceID: "service2", ExpiredAt: expireAt, SafePoint: 12},
+		{KeyspaceID: uint32(1), ServiceID: "service3", ExpiredAt: expireAt, SafePoint: 13},
+		{KeyspaceID: uint32(2), ServiceID: "service1", ExpiredAt: expireAt, SafePoint: 21},
+		{KeyspaceID: uint32(2), ServiceID: "service2", ExpiredAt: expireAt, SafePoint: 22},
+		{KeyspaceID: uint32(2), ServiceID: "service3", ExpiredAt: expireAt, SafePoint: 23},
+		{KeyspaceID: uint32(3), ServiceID: "service1", ExpiredAt: expireAt, SafePoint: 31},
+		{KeyspaceID: uint32(3), ServiceID: "service2", ExpiredAt: expireAt, SafePoint: 32},
+		{KeyspaceID: uint32(3), ServiceID: "service3", ExpiredAt: expireAt, SafePoint: 33},
 	}
 	return serviceSafePoints
 }
@@ -148,4 +148,42 @@ func TestLoadEmpty(t *testing.T) {
 	serviceSafePoint, err := storage.LoadServiceSafePointV2(1, "testService")
 	re.NoError(err)
 	re.Nil(serviceSafePoint)
+}
+
+func TestGlobalServiceSafePoint(t *testing.T) {
+	re := require.New(t)
+	storage := NewStorageWithMemoryBackend()
+	currentTime := time.Now()
+	expireAt1 := currentTime.Add(1000 * time.Second).Unix()
+	expireAt2 := currentTime.Add(2000 * time.Second).Unix()
+	expireAt3 := currentTime.Add(3000 * time.Second).Unix()
+
+	testKeyspaceID := uint32(1)
+	serviceSafePoints := []*endpoint.ServiceSafePointV2{
+		{KeyspaceID: testKeyspaceID, ServiceID: "0", ExpiredAt: expireAt1, SafePoint: 300},
+		{KeyspaceID: testKeyspaceID, ServiceID: "1", ExpiredAt: expireAt2, SafePoint: 400},
+		{KeyspaceID: testKeyspaceID, ServiceID: "2", ExpiredAt: expireAt3, SafePoint: 500},
+	}
+
+	expectMinServiceSafePoint := uint64(50)
+	globalServiceIDs := []string{endpoint.NativeBRServiceID, "test01"}
+	minGlobalSafePoints := []uint64{expectMinServiceSafePoint, expectMinServiceSafePoint + 1}
+
+	for i, globalServiceID := range globalServiceIDs {
+		ssp := &endpoint.ServiceSafePoint{
+			ServiceID: globalServiceID,
+			ExpiredAt: expireAt3,
+			SafePoint: minGlobalSafePoints[i],
+		}
+		storage.SaveServiceGCSafePoint(ssp)
+	}
+
+	for _, serviceSafePoint := range serviceSafePoints {
+		re.NoError(storage.SaveServiceSafePointV2(serviceSafePoint))
+	}
+	// enabling failpoint to make expired key removal immediately observable
+	re.NoError(failpoint.Enable("github.com/tikv/pd/pkg/storage/endpoint/removeExpiredKeys", "return(true)"))
+	minSafePoint, err := storage.LoadMinServiceSafePointV2(testKeyspaceID, currentTime)
+	re.NoError(err)
+	re.Equal(expectMinServiceSafePoint, minSafePoint.SafePoint)
 }
