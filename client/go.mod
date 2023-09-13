@@ -10,7 +10,7 @@ require (
 	github.com/pingcap/failpoint v0.0.0-20210918120811-547c13e3eb00
 	github.com/pingcap/kvproto v0.0.0-20230713060620-89756bd21be1
 	github.com/pingcap/log v1.1.1-0.20221110025148-ca232912c9f3
-	github.com/prometheus/client_golang v1.11.0
+	github.com/prometheus/client_golang v1.11.1
 	github.com/stretchr/testify v1.8.1
 	go.uber.org/goleak v1.1.11
 	go.uber.org/zap v1.20.0
