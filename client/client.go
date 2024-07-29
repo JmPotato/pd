@@ -96,7 +96,6 @@ type RPCClient interface {
 	// BatchScanRegions gets a list of regions, starts from the region that contains key.
 	// Limit limits the maximum number of regions returned. It returns all the regions in the given ranges if limit <= 0.
 	// If a region has no leader, corresponding leader will be placed by a peer
-	// with empty value (PeerID is 0).
 	// The returned regions are flattened, even there are key ranges located in the same region, only one region will be returned.
 	BatchScanRegions(ctx context.Context, keyRanges []KeyRange, limit int, opts ...GetRegionOption) ([]*Region, error)
 	// GetStore gets a store from PD by store id.
