@@ -68,24 +68,11 @@ func NewGlobalTSOAllocator(
 		cancel:                cancel,
 		cfg:                   am.cfg,
 		member:                am.member,
-		timestampOracle:       newGlobalTimestampOracle(am),
+		timestampOracle:       newTimestampOracle(am),
 		tsoAllocatorRoleGauge: tsoAllocatorRole.WithLabelValues(am.getGroupIDStr(), GlobalDCLocation),
 	}
 
 	return gta
-}
-
-func newGlobalTimestampOracle(am *AllocatorManager) *timestampOracle {
-	oracle := &timestampOracle{
-		keyspaceGroupID:        am.kgID,
-		storage:                am.storage,
-		saveInterval:           am.cfg.GetTSOSaveInterval(),
-		updatePhysicalInterval: am.cfg.GetTSOUpdatePhysicalInterval(),
-		maxResetTSGap:          am.cfg.GetMaxResetTSGap,
-		tsoMux:                 &tsoObject{},
-		metrics:                newTSOMetrics(am.getGroupIDStr(), GlobalDCLocation),
-	}
-	return oracle
 }
 
 // close is used to shutdown the primary election loop.
@@ -141,7 +128,7 @@ func (gta *GlobalTSOAllocator) generateTSO(ctx context.Context, count uint32) (p
 		return pdpb.Timestamp{}, errs.ErrGenerateTimestamp.FastGenByArgs(fmt.Sprintf("requested pd %s of cluster", errs.NotLeaderErr))
 	}
 
-	return gta.timestampOracle.getTS(ctx, gta.member, count)
+	return gta.timestampOracle.getTS(ctx, count)
 }
 
 func (gta *GlobalTSOAllocator) reset() {
