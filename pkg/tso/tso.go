@@ -61,6 +61,7 @@ type tsoObject struct {
 // timestampOracle is used to maintain the logic of TSO.
 type timestampOracle struct {
 	keyspaceGroupID uint32
+	member          ElectionMember
 	storage         endpoint.TSOStorage
 	// TODO: remove saveInterval
 	saveInterval           time.Duration
@@ -73,6 +74,27 @@ type timestampOracle struct {
 
 	// pre-initialized metrics
 	metrics *tsoMetrics
+}
+
+func newTimestampOracle(am *AllocatorManager) *timestampOracle {
+	oracle := &timestampOracle{
+		keyspaceGroupID:        am.kgID,
+		member:                 am.member,
+		storage:                am.storage,
+		saveInterval:           am.cfg.GetTSOSaveInterval(),
+		updatePhysicalInterval: am.cfg.GetTSOUpdatePhysicalInterval(),
+		maxResetTSGap:          am.cfg.GetMaxResetTSGap,
+		tsoMux:                 &tsoObject{},
+		metrics:                newTSOMetrics(am.getGroupIDStr(), GlobalDCLocation),
+	}
+	return oracle
+}
+
+func (t *timestampOracle) saveTimestamp(ts time.Time) error {
+	if !t.member.IsLeader() {
+		return errs.ErrSaveTimestamp.FastGenByArgs("not leader anymore")
+	}
+	return t.storage.SaveTimestamp(t.keyspaceGroupID, ts, t.member.GetLeadership())
 }
 
 func (t *timestampOracle) setTSOPhysical(next time.Time, force bool) {
@@ -173,7 +195,7 @@ func (t *timestampOracle) syncTimestamp() error {
 	})
 	save := next.Add(t.saveInterval)
 	start := time.Now()
-	if err = t.storage.SaveTimestamp(t.keyspaceGroupID, save); err != nil {
+	if err = t.saveTimestamp(save); err != nil {
 		t.metrics.errSaveSyncTSEvent.Inc()
 		return err
 	}
@@ -245,7 +267,7 @@ func (t *timestampOracle) resetUserTimestamp(leadership *election.Leadership, ts
 	if typeutil.SubRealTimeByWallClock(t.getLastSavedTime(), nextPhysical) <= updateTimestampGuard {
 		save := nextPhysical.Add(t.saveInterval)
 		start := time.Now()
-		if err := t.storage.SaveTimestamp(t.keyspaceGroupID, save); err != nil {
+		if err := t.saveTimestamp(save); err != nil {
 			t.metrics.errSaveResetTSEvent.Inc()
 			return err
 		}
@@ -328,7 +350,7 @@ func (t *timestampOracle) updateTimestamp() error {
 	if typeutil.SubRealTimeByWallClock(t.getLastSavedTime(), next) <= updateTimestampGuard {
 		save := next.Add(t.saveInterval)
 		start := time.Now()
-		if err := t.storage.SaveTimestamp(t.keyspaceGroupID, save); err != nil {
+		if err := t.saveTimestamp(save); err != nil {
 			log.Warn("save timestamp failed",
 				logutil.CondUint32("keyspace-group-id", t.keyspaceGroupID, t.keyspaceGroupID > 0),
 				zap.Error(err))
@@ -347,7 +369,7 @@ func (t *timestampOracle) updateTimestamp() error {
 var maxRetryCount = 10
 
 // getTS is used to get a timestamp.
-func (t *timestampOracle) getTS(ctx context.Context, member ElectionMember, count uint32) (pdpb.Timestamp, error) {
+func (t *timestampOracle) getTS(ctx context.Context, count uint32) (pdpb.Timestamp, error) {
 	defer trace.StartRegion(ctx, "timestampOracle.getTS").End()
 	var resp pdpb.Timestamp
 	if count == 0 {
@@ -357,7 +379,7 @@ func (t *timestampOracle) getTS(ctx context.Context, member ElectionMember, coun
 		currentPhysical, _ := t.getTSO()
 		if currentPhysical == typeutil.ZeroTime {
 			// If it's leader, maybe SyncTimestamp hasn't completed yet
-			if member.IsLeader() {
+			if t.member.IsLeader() {
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
@@ -379,7 +401,7 @@ func (t *timestampOracle) getTS(ctx context.Context, member ElectionMember, coun
 			continue
 		}
 		// In case lease expired after the first check.
-		if !member.IsLeader() {
+		if !t.member.IsLeader() {
 			return pdpb.Timestamp{}, errs.ErrGenerateTimestamp.FastGenByArgs(fmt.Sprintf("requested %s anymore", errs.NotLeaderErr))
 		}
 		return resp, nil
