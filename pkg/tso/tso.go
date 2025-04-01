@@ -90,6 +90,8 @@ func newTimestampOracle(am *AllocatorManager) *timestampOracle {
 	return oracle
 }
 
+// saveTimestamp wraps the storage operation to save the timestamp to etcd.
+// It provides a fast path to skip the saving if the current server is not leader anymore.
 func (t *timestampOracle) saveTimestamp(ts time.Time) error {
 	if !t.member.IsLeader() {
 		return errs.ErrSaveTimestamp.FastGenByArgs("not leader anymore")

@@ -74,6 +74,8 @@ func (se *StorageEndpoint) LoadTimestamp(prefix string) (time.Time, error) {
 // SaveTimestamp saves the timestamp to the storage. The leadership is used to check if the current server is leader
 // before saving the timestamp to ensure a strong consistency for persistence of the TSO timestamp window.
 func (se *StorageEndpoint) SaveTimestamp(groupID uint32, ts time.Time, leadership *election.Leadership) error {
+	// The PD leadership or TSO primary will always be granted first before the TSO timestamp window is saved.
+	// So we here check whether the leader value is filled to see if the requirement is met.
 	if len(leadership.GetLeaderValue()) == 0 {
 		return errors.New("leadership is not valid, leader value is empty")
 	}
