@@ -133,7 +133,7 @@ func (m *Manager) GetKeyspaceServiceLimiter(keyspaceID uint32) *serviceLimiter {
 // SetKeyspaceServiceLimit sets the service limit of the keyspace.
 func (m *Manager) SetKeyspaceServiceLimit(keyspaceID uint32, serviceLimit float64) {
 	// If the keyspace is not found, create a new keyspace resource group manager.
-	m.getOrCreateKeyspaceResourceGroupManager(keyspaceID, true).setServiceLimiter(serviceLimit)
+	m.getOrCreateKeyspaceResourceGroupManager(keyspaceID, true).setServiceLimit(serviceLimit)
 }
 
 func (m *Manager) getOrCreateKeyspaceResourceGroupManager(keyspaceID uint32, initDefault bool) *keyspaceResourceGroupManager {
@@ -339,14 +339,6 @@ func (m *Manager) GetResourceGroupList(keyspaceID uint32, withStats bool) []*Res
 	return krgm.getResourceGroupList(withStats, true)
 }
 
-func (m *Manager) getRUTracker(keyspaceID uint32, name string) *ruTracker {
-	krgm := m.getKeyspaceResourceGroupManager(keyspaceID)
-	if krgm == nil {
-		return nil
-	}
-	return krgm.getOrCreateRUTracker(name)
-}
-
 func (m *Manager) persistLoop(ctx context.Context) {
 	defer m.wg.Done()
 	ticker := time.NewTicker(persistLoopInterval)
@@ -499,8 +491,15 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 			if rg := m.GetMutableResourceGroup(keyspaceID, resourceGroupName); rg != nil {
 				rg.UpdateRUConsumption(consumptionInfo.Consumption)
 			}
-			if rt := m.getRUTracker(keyspaceID, resourceGroupName); rt != nil {
-				rt.sample(now, consumptionInfo.RRU+consumptionInfo.WRU, sinceLastRecord)
+			if krgm := m.getKeyspaceResourceGroupManager(keyspaceID); krgm != nil {
+				// Sample the latest RU consumption.
+				krgm.getOrCreateRUTracker(resourceGroupName).sample(
+					now,
+					consumptionInfo.RRU+consumptionInfo.WRU,
+					sinceLastRecord,
+				)
+				// Consiliate the fill rate of the resource group.
+				krgm.conciliateFillRates()
 			}
 		case <-cleanUpTicker.C:
 			// Clean up the metrics that have not been updated for a long time.
