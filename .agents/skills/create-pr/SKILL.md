@@ -12,7 +12,8 @@ PD contributor assistant. Push the current branch and open a well-formatted pull
 
 | File | Contents | Load When |
 |---|---|---|
-| [references/pr-template.md](references/pr-template.md) | The exact PR template from `.github/pull_request_template.md` | **Phase 2** — when composing the PR body |
+| `.github/pull_request_template.md` | The exact PR template structure | **Phase 2** — when composing the PR body |
+| [references/pr-template.md](references/pr-template.md) | Additional filling guidelines for the PR template | **Phase 2** — when composing the PR body |
 
 # Workflow
 
@@ -30,7 +31,7 @@ Collect all information needed to fill the PR template. Run these in parallel:
 
 ## Phase 2: Compose PR Content
 
-> **Load [references/pr-template.md](references/pr-template.md) now.**
+> **Load `.github/pull_request_template.md` and [references/pr-template.md](references/pr-template.md) now.**
 
 ### PR Title
 

@@ -1,59 +1,6 @@
 # PD Pull Request Template
 
-Source: `.github/pull_request_template.md`
-
-## Template Structure
-
-The PR body must follow this exact structure:
-
-```markdown
-### What problem does this PR solve?
-
-Issue Number: Close #xxx
-
-<description of the problem>
-
-### What is changed and how does it work?
-
-<description of the changes and implementation approach>
-
-```commit-message
-<concise commit message for squash-merge>
-```
-
-### Check List
-
-Tests
-
-- Unit test
-- Integration test
-- Manual test (add detailed scripts or steps below)
-- No code
-
-Code changes
-
-- Has the configuration change
-- Has HTTP APIs changed (Don't forget to [add the declarative for the new API](https://github.com/tikv/pd/blob/master/docs/development.md#updating-api-documentation))
-- Has persistent data change
-
-Side effects
-
-- Possible performance regression
-- Increased code complexity
-- Breaking backward compatibility
-
-Related changes
-
-- PR to update [`pingcap/docs`](https://github.com/pingcap/docs)/[`pingcap/docs-cn`](https://github.com/pingcap/docs-cn):
-- PR to update [`pingcap/tiup`](https://github.com/pingcap/tiup):
-- Need to cherry-pick to the release branch
-
-### Release note
-
-```release-note
-None.
-```
-```
+> **Template source**: Read `.github/pull_request_template.md` for the exact structure. The PR body must follow that template. Below are additional filling guidelines only.
 
 ## Filling Guidelines
 
