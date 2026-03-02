@@ -57,6 +57,7 @@ Fill every section of the PR template:
    - **Code changes**: Check if configuration, HTTP API, or persistent data changed.
    - **Side effects**: Assess performance regression, complexity, and backward compatibility.
    - **Related changes**: Leave blank unless obvious from context.
+   - **Omit empty subsections**: If Code changes, Side effects, or Related changes have no items, remove their heading entirely from the PR body.
 
 4. **Release note**
    - If the change is a bug fix or new feature, write a user-facing release note.
