@@ -45,7 +45,8 @@ Follow the PD convention: `pkg [, pkg2]: short description`
 Fill every section of the PR template:
 
 1. **What problem does this PR solve?**
-   - Write `Issue Number: ref #xxx` if the user provides an issue number, otherwise write `Issue Number: Close #xxx` as a placeholder and ask the user for the actual issue number.
+   - If the user provides issue numbers, ask whether each should be `close` or `ref`, then write the appropriate `Issue Number: close #xxx` or `Issue Number: ref #xxx` line.
+   - If issue numbers are unknown, ask the user first. Do not invent placeholders.
    - Summarize the problem being solved based on commit messages and diff analysis.
 
 2. **What is changed and how does it work?**
@@ -72,12 +73,12 @@ Show the composed PR title and full body to the user for review **before** creat
 After user approval:
 
 1. Push the branch:
-   ```
+   ```bash
    git push -u origin <branch-name>
    ```
 
 2. Create the PR:
-   ```
+   ```bash
    gh pr create --repo tikv/pd --title "<title>" --body "<body>"
    ```
    Use a HEREDOC for the body to preserve formatting.
