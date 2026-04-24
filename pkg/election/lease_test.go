@@ -23,6 +23,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/tikv/pd/pkg/utils/etcdutil"
+	"github.com/tikv/pd/pkg/utils/testutil"
 )
 
 func TestLease(t *testing.T) {
@@ -69,9 +70,7 @@ func TestLease(t *testing.T) {
 	// Grant the lease1 and keep it alive.
 	re.NoError(lease1.Grant(defaultLeaseTimeout))
 	re.False(lease1.IsExpired())
-	ctx, cancel := context.WithCancel(context.Background())
-	go lease1.KeepAlive(ctx)
-	defer cancel()
+	go lease1.KeepAlive(t.Context())
 
 	// Wait for a timeout.
 	time.Sleep((defaultLeaseTimeout + 1) * time.Second)
@@ -92,14 +91,12 @@ func TestLeaseKeepAlive(t *testing.T) {
 	lease := NewLease(client, "test_lease")
 	re.NoError(lease.Grant(defaultLeaseTimeout))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go lease.KeepAlive(ctx)
+	go lease.KeepAlive(t.Context())
 
-	origExpire := lease.expireTime.Load().(time.Time)
-	re.Eventually(func() bool {
-		return lease.expireTime.Load().(time.Time).After(origExpire)
-	}, (defaultLeaseTimeout+1)*time.Second, 50*time.Millisecond)
+	origExpire := lease.getExpireTime()
+	testutil.Eventually(re, func() bool {
+		return lease.getExpireTime().After(origExpire)
+	})
 
 	re.NoError(lease.Close())
 }
@@ -108,7 +105,7 @@ func TestLeaseKeepAliveRefreshesExpireTime(t *testing.T) {
 	re := require.New(t)
 	keepAliveCh := make(chan *clientv3.LeaseKeepAliveResponse)
 	lease := newTestLeaseWithKeepAliveCh(keepAliveCh, 5*time.Second)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
@@ -117,43 +114,41 @@ func TestLeaseKeepAliveRefreshesExpireTime(t *testing.T) {
 	}()
 
 	sendKeepAliveResponse(t, keepAliveCh, 30)
-	re.Eventually(func() bool {
-		expire := lease.expireTime.Load().(time.Time)
+	testutil.Eventually(re, func() bool {
+		expire := lease.getExpireTime()
 		return time.Until(expire) > 20*time.Second
-	}, time.Second, 10*time.Millisecond)
+	})
 
 	cancel()
-	re.Eventually(func() bool {
+	testutil.Eventually(re, func() bool {
 		select {
 		case <-done:
 			return true
 		default:
 			return false
 		}
-	}, time.Second, 10*time.Millisecond)
+	})
 }
 
 func TestLeaseKeepAliveExitsWhenWorkerChannelCloses(t *testing.T) {
 	re := require.New(t)
 	keepAliveCh := make(chan *clientv3.LeaseKeepAliveResponse)
 	lease := newTestLeaseWithKeepAliveCh(keepAliveCh, time.Hour)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		lease.KeepAlive(ctx)
+		lease.KeepAlive(t.Context())
 		close(done)
 	}()
 
 	close(keepAliveCh)
-	re.Eventually(func() bool {
+	testutil.Eventually(re, func() bool {
 		select {
 		case <-done:
 			return true
 		default:
 			return false
 		}
-	}, time.Second, 10*time.Millisecond)
+	})
 }
 
 // TestLeaseKeepAliveExitsOnInvalidTTL verifies that a keepalive response with
@@ -163,24 +158,22 @@ func TestLeaseKeepAliveExitsOnInvalidTTL(t *testing.T) {
 	re := require.New(t)
 	keepAliveCh := make(chan *clientv3.LeaseKeepAliveResponse, 1)
 	lease := newTestLeaseWithKeepAliveCh(keepAliveCh, 5*time.Second)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	done := make(chan struct{})
 	go func() {
-		lease.KeepAlive(ctx)
+		lease.KeepAlive(t.Context())
 		close(done)
 	}()
 
 	sendKeepAliveResponse(t, keepAliveCh, 0)
-	re.Eventually(func() bool {
+	testutil.Eventually(re, func() bool {
 		select {
 		case <-done:
 			return true
 		default:
 			return false
 		}
-	}, time.Second, 10*time.Millisecond)
+	})
 }
 
 // TestLeaseKeepAliveKeepsExpireMonotonic verifies that when a response with a
@@ -191,16 +184,14 @@ func TestLeaseKeepAliveKeepsExpireMonotonic(t *testing.T) {
 	re := require.New(t)
 	keepAliveCh := make(chan *clientv3.LeaseKeepAliveResponse, 1)
 	lease := newTestLeaseWithKeepAliveCh(keepAliveCh, time.Hour)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go lease.KeepAlive(ctx)
+	go lease.KeepAlive(t.Context())
 
 	// The large TTL lands first and should push expireTime well into the future.
 	sendKeepAliveResponse(t, keepAliveCh, 30)
-	re.Eventually(func() bool {
-		return time.Until(lease.expireTime.Load().(time.Time)) > 20*time.Second
-	}, time.Second, 10*time.Millisecond)
-	beforeSmall := lease.expireTime.Load().(time.Time)
+	testutil.Eventually(re, func() bool {
+		return time.Until(lease.getExpireTime()) > 20*time.Second
+	})
+	beforeSmall := lease.getExpireTime()
 
 	// A subsequent smaller TTL must not regress expireTime, because its absolute
 	// deadline is earlier than the stored maxExpire.
@@ -208,7 +199,7 @@ func TestLeaseKeepAliveKeepsExpireMonotonic(t *testing.T) {
 	// Give the loop a beat to process and (incorrectly) store the smaller expire
 	// if the monotonicity guard were missing.
 	time.Sleep(100 * time.Millisecond)
-	afterSmall := lease.expireTime.Load().(time.Time)
+	afterSmall := lease.getExpireTime()
 	re.False(afterSmall.Before(beforeSmall))
 }
 
