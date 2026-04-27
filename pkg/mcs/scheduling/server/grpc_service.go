@@ -64,6 +64,7 @@ type ConfigProvider any
 
 // Service is the scheduling grpc service.
 type Service struct {
+	schedulingpb.UnimplementedSchedulingServer
 	*Server
 }
 
