@@ -29,6 +29,7 @@ const (
 	defaultMaxTSOBatchWaitInterval time.Duration = 0
 	defaultEnableTSOFollowerProxy                = false
 	defaultEnableFollowerHandle                  = false
+	defaultEnableRouterClient                    = false
 	defaultTSOClientRPCConcurrency               = 1
 )
 
@@ -46,6 +47,8 @@ const (
 	EnableFollowerHandle
 	// TSOClientRPCConcurrency controls the amount of ongoing TSO RPC requests at the same time in a single TSO client.
 	TSOClientRPCConcurrency
+	// EnableRouterClient is the QueryRegion stream client option.
+	EnableRouterClient
 
 	dynamicOptionCount
 )
@@ -81,6 +84,7 @@ func newOption() *option {
 	co.dynamicOptions[EnableTSOFollowerProxy].Store(defaultEnableTSOFollowerProxy)
 	co.dynamicOptions[EnableFollowerHandle].Store(defaultEnableFollowerHandle)
 	co.dynamicOptions[TSOClientRPCConcurrency].Store(defaultTSOClientRPCConcurrency)
+	co.dynamicOptions[EnableRouterClient].Store(defaultEnableRouterClient)
 	return co
 }
 
@@ -108,6 +112,14 @@ func (o *option) setEnableFollowerHandle(enable bool) {
 // getMaxTSOBatchWaitInterval gets the Follower Handle enable option.
 func (o *option) getEnableFollowerHandle() bool {
 	return o.dynamicOptions[EnableFollowerHandle].Load().(bool)
+}
+
+func (o *option) setEnableRouterClient(enable bool) {
+	o.dynamicOptions[EnableRouterClient].Store(enable)
+}
+
+func (o *option) getEnableRouterClient() bool {
+	return o.dynamicOptions[EnableRouterClient].Load().(bool)
 }
 
 // getMaxTSOBatchWaitInterval gets the max TSO batch wait interval option.
@@ -227,6 +239,13 @@ func WithCustomTimeoutOption(timeout time.Duration) ClientOption {
 func WithForwardingOption(enableForwarding bool) ClientOption {
 	return func(c *client) {
 		c.option.enableForwarding = enableForwarding
+	}
+}
+
+// WithEnableRouterClient enables the QueryRegion stream client.
+func WithEnableRouterClient(enable bool) ClientOption {
+	return func(c *client) {
+		c.option.setEnableRouterClient(enable)
 	}
 }
 
