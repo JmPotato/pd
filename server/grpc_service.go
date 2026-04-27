@@ -1637,6 +1637,73 @@ func (s *GrpcServer) GetRegionByID(ctx context.Context, request *pdpb.GetRegionB
 	}, nil
 }
 
+// QueryRegion provides a stream processing of the region query.
+func (s *GrpcServer) QueryRegion(stream pdpb.PD_QueryRegionServer) error {
+	if s.GetServiceMiddlewarePersistOptions().IsGRPCRateLimitEnabled() {
+		fName := currentFunction()
+		limiter := s.GetGRPCRateLimiter()
+		if done, err := limiter.Allow(fName); err == nil {
+			defer done()
+		} else {
+			return err
+		}
+	}
+	for {
+		request, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if clusterID := keypath.ClusterID(); request.GetHeader().GetClusterId() != clusterID {
+			return status.Errorf(codes.FailedPrecondition, "mismatch cluster id, need %d but got %d", clusterID, request.GetHeader().GetClusterId())
+		}
+
+		var rc *cluster.RaftCluster
+		isServing := s.IsServing()
+		if isServing {
+			rc = s.GetRaftCluster()
+			if rc == nil {
+				if err = stream.Send(&pdpb.QueryRegionResponse{Header: notBootstrappedHeader()}); err != nil {
+					return errors.WithStack(err)
+				}
+				continue
+			}
+		} else {
+			rc = s.cluster
+			if rc == nil || !rc.GetRegionSyncer().IsRunning() {
+				if err = stream.Send(&pdpb.QueryRegionResponse{Header: regionNotFound()}); err != nil {
+					return errors.WithStack(err)
+				}
+				continue
+			}
+		}
+		failpoint.Inject("queryRegionMetError", func() {
+			failpoint.Return(errs.ErrNotBootstrapped.FastGenByArgs())
+		})
+
+		start := time.Now()
+		needBuckets := isServing && rc.GetStoreConfig().IsEnableRegionBucket() && request.GetNeedBuckets()
+		keyIDMap, prevKeyIDMap, regionsByID := rc.QueryRegions(
+			request.GetKeys(),
+			request.GetPrevKeys(),
+			request.GetIds(),
+			needBuckets,
+		)
+		resp := &pdpb.QueryRegionResponse{
+			Header:       wrapHeader(),
+			KeyIdMap:     keyIDMap,
+			PrevKeyIdMap: prevKeyIDMap,
+			RegionsById:  regionsByID,
+		}
+		queryRegionDuration.Observe(time.Since(start).Seconds())
+		if err := stream.Send(resp); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+}
+
 // Deprecated: use BatchScanRegions instead.
 // ScanRegions implements gRPC PDServer.
 func (s *GrpcServer) ScanRegions(ctx context.Context, request *pdpb.ScanRegionsRequest) (*pdpb.ScanRegionsResponse, error) {

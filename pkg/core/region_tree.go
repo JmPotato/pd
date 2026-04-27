@@ -281,6 +281,24 @@ func (t *regionTree) searchPrev(regionKey []byte) *RegionInfo {
 	return prevRegionItem.RegionInfo
 }
 
+// searchByKeys searches the regions by keys and returns a slice whose order matches the input keys.
+func (t *regionTree) searchByKeys(keys [][]byte) []*RegionInfo {
+	regions := make([]*RegionInfo, len(keys))
+	for idx, key := range keys {
+		regions[idx] = t.search(key)
+	}
+	return regions
+}
+
+// searchByPrevKeys searches the previous regions by keys and returns a slice whose order matches the input keys.
+func (t *regionTree) searchByPrevKeys(prevKeys [][]byte) []*RegionInfo {
+	regions := make([]*RegionInfo, len(prevKeys))
+	for idx, key := range prevKeys {
+		regions[idx] = t.searchPrev(key)
+	}
+	return regions
+}
+
 // find returns the range item contains the start key.
 func (t *regionTree) find(item *regionItem) *regionItem {
 	var result *regionItem

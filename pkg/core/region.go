@@ -36,6 +36,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/replication_modepb"
 	"github.com/pingcap/log"
 	"github.com/tikv/pd/pkg/errs"
+	"github.com/tikv/pd/pkg/slice"
 	"github.com/tikv/pd/pkg/utils/keyutil"
 	"github.com/tikv/pd/pkg/utils/logutil"
 	"github.com/tikv/pd/pkg/utils/syncutil"
@@ -47,6 +48,8 @@ const (
 	randomRegionMaxRetry = 10
 	// ScanRegionLimit is the default limit for the number of regions to scan in a region scan request.
 	ScanRegionLimit = 1000
+	// batchSearchSize is the default size for the number of IDs/keys/prevKeys to search in a batch.
+	batchSearchSize = 128
 	// CollectFactor is the factor to collect the count of region.
 	CollectFactor = 0.9
 )
@@ -1479,6 +1482,103 @@ func (r *RegionsInfo) GetStoreRegions(storeID uint64) []*RegionInfo {
 	}
 	// no need to consider witness, as it is already included in leaders, followers and learners
 	return regions
+}
+
+// QueryRegions searches RegionInfo from regionTree by keys and IDs in batch.
+func (r *RegionsInfo) QueryRegions(
+	keys, prevKeys [][]byte, ids []uint64, needBuckets bool,
+) (keyIDMap, prevKeyIDMap []uint64, regionsByID map[uint64]*pdpb.RegionResponse) {
+	regions := r.getRegionsByKeys(keys)
+	prevRegions := r.getRegionsByPrevKeys(prevKeys)
+
+	regionsByID = make(map[uint64]*pdpb.RegionResponse, len(regions)+len(prevRegions)+len(ids))
+	keyIDMap = sortOutKeyIDMap(regionsByID, regions, needBuckets)
+	prevKeyIDMap = sortOutKeyIDMap(regionsByID, prevRegions, needBuckets)
+
+	idsToQuery := make([]uint64, 0, len(ids))
+	for _, id := range ids {
+		if regionFound, ok := regionsByID[id]; (ok && regionFound != nil) || id == 0 {
+			continue
+		}
+		idsToQuery = append(idsToQuery, id)
+	}
+
+	regions = r.getRegionsByIDs(idsToQuery)
+	for i, id := range idsToQuery {
+		regionsByID[id] = buildRegionResponse(regions[i], needBuckets)
+	}
+	return keyIDMap, prevKeyIDMap, regionsByID
+}
+
+// getRegionsByKeys searches RegionInfo from regionTree by keys.
+func (r *RegionsInfo) getRegionsByKeys(keys [][]byte) []*RegionInfo {
+	regions := make([]*RegionInfo, 0, len(keys))
+	for _, batch := range slice.SplitIntoBatches(keys, batchSearchSize) {
+		r.t.RLock()
+		results := r.tree.searchByKeys(batch)
+		r.t.RUnlock()
+		regions = append(regions, results...)
+	}
+	return regions
+}
+
+// getRegionsByPrevKeys searches previous RegionInfo from regionTree by keys.
+func (r *RegionsInfo) getRegionsByPrevKeys(prevKeys [][]byte) []*RegionInfo {
+	regions := make([]*RegionInfo, 0, len(prevKeys))
+	for _, batch := range slice.SplitIntoBatches(prevKeys, batchSearchSize) {
+		r.t.RLock()
+		results := r.tree.searchByPrevKeys(batch)
+		r.t.RUnlock()
+		regions = append(regions, results...)
+	}
+	return regions
+}
+
+// getRegionsByIDs searches RegionInfo from regionMap by IDs in batch.
+func (r *RegionsInfo) getRegionsByIDs(ids []uint64) []*RegionInfo {
+	regions := make([]*RegionInfo, 0, len(ids))
+	for _, batch := range slice.SplitIntoBatches(ids, batchSearchSize) {
+		r.t.RLock()
+		for _, id := range batch {
+			regions = append(regions, r.getRegionLocked(id))
+		}
+		r.t.RUnlock()
+	}
+	return regions
+}
+
+func sortOutKeyIDMap(
+	regionsByID map[uint64]*pdpb.RegionResponse, regions []*RegionInfo, needBuckets bool,
+) []uint64 {
+	keyIDMap := make([]uint64, len(regions))
+	for idx, region := range regions {
+		if region == nil {
+			continue
+		}
+		regionID := region.GetID()
+		keyIDMap[idx] = regionID
+		if regionFound, ok := regionsByID[regionID]; (ok && regionFound != nil) || regionID == 0 {
+			continue
+		}
+		regionsByID[regionID] = buildRegionResponse(region, needBuckets)
+	}
+	return keyIDMap
+}
+
+func buildRegionResponse(region *RegionInfo, needBuckets bool) *pdpb.RegionResponse {
+	if region == nil {
+		return nil
+	}
+	regionResp := &pdpb.RegionResponse{
+		Region:       region.GetMeta(),
+		Leader:       region.GetLeader(),
+		DownPeers:    region.GetDownPeers(),
+		PendingPeers: region.GetPendingPeers(),
+	}
+	if needBuckets {
+		regionResp.Buckets = region.GetBuckets()
+	}
+	return regionResp
 }
 
 // SubTreeRegionType is the type of sub tree region.

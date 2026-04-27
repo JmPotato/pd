@@ -1261,3 +1261,97 @@ func TestScanRegionLimit(t *testing.T) {
 		re.Len(resp, limit)
 	}
 }
+
+func TestQueryRegions(t *testing.T) {
+	re := require.New(t)
+	regions := NewRegionsInfo()
+	regions.CheckAndPutRegion(NewTestRegionInfo(1, 1, []byte("a"), []byte("b")))
+	regions.CheckAndPutRegion(NewTestRegionInfo(2, 1, []byte("b"), []byte("c")))
+	regions.CheckAndPutRegion(NewTestRegionInfo(3, 1, []byte("d"), []byte("e")))
+
+	keyIDMap, prevKeyIDMap, regionsByID := regions.QueryRegions(
+		[][]byte{[]byte("a"), []byte("b"), []byte("c")},
+		nil,
+		nil,
+		false,
+	)
+	re.Equal([]uint64{1, 2, 0}, keyIDMap)
+	re.Empty(prevKeyIDMap)
+	re.Len(regionsByID, 2)
+	re.Equal(uint64(1), regionsByID[1].GetRegion().GetId())
+	re.Equal(uint64(2), regionsByID[2].GetRegion().GetId())
+
+	keyIDMap, prevKeyIDMap, regionsByID = regions.QueryRegions(
+		nil,
+		nil,
+		[]uint64{1, 2, 3},
+		false,
+	)
+	re.Empty(keyIDMap)
+	re.Empty(prevKeyIDMap)
+	re.Len(regionsByID, 3)
+	re.Equal(uint64(1), regionsByID[1].GetRegion().GetId())
+	re.Equal(uint64(2), regionsByID[2].GetRegion().GetId())
+	re.Equal(uint64(3), regionsByID[3].GetRegion().GetId())
+
+	keyIDMap, prevKeyIDMap, regionsByID = regions.QueryRegions(
+		nil,
+		nil,
+		[]uint64{4},
+		false,
+	)
+	re.Empty(keyIDMap)
+	re.Empty(prevKeyIDMap)
+	re.Len(regionsByID, 1)
+	re.Nil(regionsByID[4])
+
+	keyIDMap, prevKeyIDMap, regionsByID = regions.QueryRegions(
+		[][]byte{[]byte("c")},
+		nil,
+		nil,
+		false,
+	)
+	re.Equal([]uint64{0}, keyIDMap)
+	re.Empty(prevKeyIDMap)
+	re.Empty(regionsByID)
+
+	keyIDMap, prevKeyIDMap, regionsByID = regions.QueryRegions(
+		[][]byte{[]byte("c")},
+		nil,
+		[]uint64{4},
+		false,
+	)
+	re.Equal([]uint64{0}, keyIDMap)
+	re.Empty(prevKeyIDMap)
+	re.Nil(regionsByID[4])
+
+	keyIDMap, prevKeyIDMap, regionsByID = regions.QueryRegions(
+		[][]byte{[]byte("b"), []byte("c")},
+		[][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("d"), []byte("e"), []byte("f")},
+		[]uint64{1, 3},
+		false,
+	)
+	re.Equal([]uint64{2, 0}, keyIDMap)
+	re.Equal([]uint64{0, 1, 0, 0, 0, 0}, prevKeyIDMap)
+	re.Len(regionsByID, 3)
+	re.Equal(uint64(1), regionsByID[1].GetRegion().GetId())
+	re.Equal(uint64(2), regionsByID[2].GetRegion().GetId())
+	re.Equal(uint64(3), regionsByID[3].GetRegion().GetId())
+}
+
+func TestQueryRegionsNeedBuckets(t *testing.T) {
+	re := require.New(t)
+	buckets := &metapb.Buckets{
+		RegionId: 1,
+		Version:  1,
+		Keys:     [][]byte{[]byte("a"), []byte("b")},
+	}
+	regions := NewRegionsInfo()
+	regions.CheckAndPutRegion(NewTestRegionInfo(1, 1, []byte("a"), []byte("b"), SetBuckets(buckets)))
+
+	_, _, regionsByID := regions.QueryRegions(nil, nil, []uint64{1}, false)
+	re.Nil(regionsByID[1].GetBuckets())
+
+	_, _, regionsByID = regions.QueryRegions(nil, nil, []uint64{1}, true)
+	re.Equal(buckets, regionsByID[1].GetBuckets())
+}
