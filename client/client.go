@@ -25,9 +25,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
@@ -665,6 +668,12 @@ func (c *client) UpdateOption(option DynamicOption, value any) error {
 			return errors.New("[pd] invalid value type for EnableFollowerHandle option, it should be bool")
 		}
 		c.option.setEnableFollowerHandle(enable)
+	case EnableRouterClient:
+		enable, ok := value.(bool)
+		if !ok {
+			return errors.New("[pd] invalid value type for EnableRouterClient option, it should be bool")
+		}
+		c.option.setEnableRouterClient(enable)
 	case TSOClientRPCConcurrency:
 		value, ok := value.(int)
 		if !ok {
@@ -849,6 +858,92 @@ func handleRegionResponse(res *pdpb.GetRegionResponse) *Region {
 	return r
 }
 
+func cloneRegionResponse(res *pdpb.RegionResponse) *Region {
+	if res == nil || res.Region == nil {
+		return nil
+	}
+
+	r := &Region{
+		Meta:         proto.Clone(res.Region).(*metapb.Region),
+		PendingPeers: make([]*metapb.Peer, 0, len(res.PendingPeers)),
+	}
+	if res.Leader != nil {
+		r.Leader = proto.Clone(res.Leader).(*metapb.Peer)
+	}
+	if res.Buckets != nil {
+		r.Buckets = proto.Clone(res.Buckets).(*metapb.Buckets)
+	}
+	for _, s := range res.DownPeers {
+		if s == nil || s.Peer == nil {
+			r.DownPeers = append(r.DownPeers, nil)
+			continue
+		}
+		r.DownPeers = append(r.DownPeers, proto.Clone(s.Peer).(*metapb.Peer))
+	}
+	for _, p := range res.PendingPeers {
+		if p == nil {
+			r.PendingPeers = append(r.PendingPeers, nil)
+			continue
+		}
+		r.PendingPeers = append(r.PendingPeers, proto.Clone(p).(*metapb.Peer))
+	}
+	return r
+}
+
+func regionFromQueryResponse(resp *pdpb.QueryRegionResponse, regionID uint64) *Region {
+	if regionID == 0 {
+		return nil
+	}
+	return cloneRegionResponse(resp.GetRegionsById()[regionID])
+}
+
+func firstRegionID(ids []uint64) uint64 {
+	if len(ids) == 0 {
+		return 0
+	}
+	return ids[0]
+}
+
+func shouldFallbackQueryRegion(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	switch status.Code(errors.Cause(err)) {
+	case codes.Unimplemented, codes.Unavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *client) queryRegion(
+	ctx context.Context,
+	req *pdpb.QueryRegionRequest,
+	allowFollower bool,
+) (resp *pdpb.QueryRegionResponse, fallback bool, err error) {
+	serviceClient, cctx := c.getRegionAPIClientAndContext(ctx, allowFollower)
+	if serviceClient == nil {
+		return nil, false, errs.ErrClientGetProtoClient
+	}
+
+	stream, err := pdpb.NewPDClient(serviceClient.GetClientConn()).QueryRegion(cctx)
+	if err != nil {
+		return nil, shouldFallbackQueryRegion(ctx, err), err
+	}
+	defer stream.CloseSend()
+	if err = stream.Send(req); err != nil {
+		return nil, shouldFallbackQueryRegion(ctx, err), err
+	}
+	resp, err = stream.Recv()
+	if err != nil {
+		return nil, shouldFallbackQueryRegion(ctx, err), err
+	}
+	if serviceClient.NeedRetry(resp.GetHeader().GetError(), nil) {
+		return nil, true, nil
+	}
+	return resp, false, nil
+}
+
 // GetRegionFromMember implements the RPCClient interface.
 func (c *client) GetRegionFromMember(ctx context.Context, key []byte, memberURLs []string, _ ...GetRegionOption) (*Region, error) {
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
@@ -903,6 +998,19 @@ func (c *client) GetRegion(ctx context.Context, key []byte, opts ...GetRegionOpt
 	for _, opt := range opts {
 		opt(options)
 	}
+	if c.option.getEnableRouterClient() {
+		resp, fallback, err := c.queryRegion(ctx, &pdpb.QueryRegionRequest{
+			Header:      c.requestHeader(),
+			NeedBuckets: options.needBuckets,
+			Keys:        [][]byte{key},
+		}, options.allowFollowerHandle && c.option.getEnableFollowerHandle())
+		if !fallback {
+			if err = c.respForErr(metrics.CmdFailDurationGetRegion, start, err, resp.GetHeader()); err != nil {
+				return nil, err
+			}
+			return regionFromQueryResponse(resp, firstRegionID(resp.GetKeyIdMap())), nil
+		}
+	}
 	req := &pdpb.GetRegionRequest{
 		Header:      c.requestHeader(),
 		RegionKey:   key,
@@ -940,6 +1048,19 @@ func (c *client) GetPrevRegion(ctx context.Context, key []byte, opts ...GetRegio
 	options := &GetRegionOp{}
 	for _, opt := range opts {
 		opt(options)
+	}
+	if c.option.getEnableRouterClient() {
+		resp, fallback, err := c.queryRegion(ctx, &pdpb.QueryRegionRequest{
+			Header:      c.requestHeader(),
+			NeedBuckets: options.needBuckets,
+			PrevKeys:    [][]byte{key},
+		}, options.allowFollowerHandle && c.option.getEnableFollowerHandle())
+		if !fallback {
+			if err = c.respForErr(metrics.CmdFailDurationGetPrevRegion, start, err, resp.GetHeader()); err != nil {
+				return nil, err
+			}
+			return regionFromQueryResponse(resp, firstRegionID(resp.GetPrevKeyIdMap())), nil
+		}
 	}
 	req := &pdpb.GetRegionRequest{
 		Header:      c.requestHeader(),
@@ -979,6 +1100,19 @@ func (c *client) GetRegionByID(ctx context.Context, regionID uint64, opts ...Get
 	options := &GetRegionOp{}
 	for _, opt := range opts {
 		opt(options)
+	}
+	if c.option.getEnableRouterClient() {
+		resp, fallback, err := c.queryRegion(ctx, &pdpb.QueryRegionRequest{
+			Header:      c.requestHeader(),
+			NeedBuckets: options.needBuckets,
+			Ids:         []uint64{regionID},
+		}, options.allowFollowerHandle && c.option.getEnableFollowerHandle())
+		if !fallback {
+			if err = c.respForErr(metrics.CmdFailedDurationGetRegionByID, start, err, resp.GetHeader()); err != nil {
+				return nil, err
+			}
+			return regionFromQueryResponse(resp, regionID), nil
+		}
 	}
 	req := &pdpb.GetRegionByIDRequest{
 		Header:      c.requestHeader(),
