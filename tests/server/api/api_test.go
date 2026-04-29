@@ -110,6 +110,49 @@ func TestReconnect(t *testing.T) {
 	}
 }
 
+func TestLeaderLeaseConfigAPI(t *testing.T) {
+	re := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cluster, err := tests.NewTestCluster(ctx, 1, func(conf *config.Config, _ string) {
+		conf.LeaderLease = 7
+	})
+	re.NoError(err)
+	defer cluster.Destroy()
+
+	re.NoError(cluster.RunInitialServers())
+	re.NotEmpty(cluster.WaitLeader())
+	leader := cluster.GetLeaderServer()
+	configURL := leader.GetAddr() + "/pd/api/v1/config"
+
+	var cfg map[string]any
+	err = testutil.ReadGetJSON(re, tests.TestDialClient, configURL, &cfg)
+	re.NoError(err)
+	re.Equal(float64(7), cfg["lease"])
+	_, hasLeader := cfg["leader"]
+	re.False(hasLeader)
+
+	data, err := json.Marshal(map[string]any{"lease": 10})
+	re.NoError(err)
+	err = testutil.CheckPostJSON(tests.TestDialClient, configURL, data, testutil.StatusOK(re))
+	re.NoError(err)
+	re.Equal(int64(10), leader.GetServer().GetPersistOptions().GetLeaderLease())
+
+	err = testutil.ReadGetJSON(re, tests.TestDialClient, configURL, &cfg)
+	re.NoError(err)
+	re.Equal(float64(10), cfg["lease"])
+	_, hasLeader = cfg["leader"]
+	re.False(hasLeader)
+
+	for _, lease := range []int64{0, -1} {
+		data, err = json.Marshal(map[string]any{"lease": lease})
+		re.NoError(err)
+		err = testutil.CheckPostJSON(tests.TestDialClient, configURL, data, testutil.Status(re, http.StatusBadRequest))
+		re.NoError(err)
+		re.Equal(int64(10), leader.GetServer().GetPersistOptions().GetLeaderLease())
+	}
+}
+
 type middlewareTestSuite struct {
 	suite.Suite
 	cleanup func()

@@ -215,6 +215,8 @@ func (h *confHandler) updateConfig(cfg *config.Config, key string, value any) er
 		return h.updateMicroserviceConfig(cfg, kp[len(kp)-1], value)
 	case "controller":
 		return h.updateControllerConfig(kp[len(kp)-1], value)
+	case "lease":
+		return h.updateLeaderLease(cfg, value)
 	}
 	return errors.Errorf("config prefix %s not found", kp[0])
 }
@@ -252,6 +254,20 @@ func (h *confHandler) updateMicroserviceConfig(config *config.Config, key string
 		err = h.svr.SetMicroserviceConfig(config.Microservice)
 	}
 	return err
+}
+
+func (h *confHandler) updateLeaderLease(config *config.Config, value any) error {
+	updated, found, err := jsonutil.AddKeyValue(config, "lease", value)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errors.New("config item lease not found")
+	}
+	if updated {
+		return h.svr.SetLeaderLease(config.LeaderLease)
+	}
+	return nil
 }
 
 func (h *confHandler) updateSchedule(config *config.Config, key string, value any) error {

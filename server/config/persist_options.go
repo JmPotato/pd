@@ -55,6 +55,7 @@ type PersistOptions struct {
 	keyspace        atomic.Value
 	microservice    atomic.Value
 	storeConfig     atomic.Value
+	leaderLease     atomic.Int64
 	clusterVersion  unsafe.Pointer
 }
 
@@ -68,6 +69,7 @@ func NewPersistOptions(cfg *Config) *PersistOptions {
 	o.labelProperty.Store(cfg.LabelProperty)
 	o.keyspace.Store(&cfg.Keyspace)
 	o.microservice.Store(&cfg.Microservice)
+	o.leaderLease.Store(cfg.LeaderLease)
 	// storeConfig will be fetched from TiKV later,
 	// set it to an empty config here first.
 	o.storeConfig.Store(&sc.StoreConfig{})
@@ -154,6 +156,16 @@ func (o *PersistOptions) GetStoreConfig() *sc.StoreConfig {
 // SetStoreConfig sets the store configuration.
 func (o *PersistOptions) SetStoreConfig(cfg *sc.StoreConfig) {
 	o.storeConfig.Store(cfg)
+}
+
+// GetLeaderLease returns the PD leader lease timeout in seconds.
+func (o *PersistOptions) GetLeaderLease() int64 {
+	return o.leaderLease.Load()
+}
+
+// SetLeaderLease sets the PD leader lease timeout in seconds.
+func (o *PersistOptions) SetLeaderLease(lease int64) {
+	o.leaderLease.Store(lease)
 }
 
 // GetClusterVersion returns the cluster version.
@@ -781,6 +793,7 @@ func (o *PersistOptions) Persist(storage endpoint.ConfigStorage) error {
 			Keyspace:        *o.GetKeyspaceConfig(),
 			Microservice:    *o.GetMicroserviceConfig(),
 			ClusterVersion:  *o.GetClusterVersion(),
+			LeaderLease:     o.GetLeaderLease(),
 		},
 		StoreConfig: *o.GetStoreConfig(),
 	}
@@ -792,13 +805,7 @@ func (o *PersistOptions) Persist(storage endpoint.ConfigStorage) error {
 
 // Reload reloads the configuration from the storage.
 func (o *PersistOptions) Reload(storage endpoint.ConfigStorage) error {
-	cfg := &persistedConfig{Config: &Config{}}
-	// Pass nil to initialize cfg to default values (all items undefined)
-	if err := cfg.Adjust(nil, true); err != nil {
-		return err
-	}
-
-	isExist, err := storage.LoadConfig(cfg)
+	cfg, isExist, err := loadPersistedConfig(storage)
 	if err != nil {
 		return err
 	}
@@ -813,10 +820,40 @@ func (o *PersistOptions) Reload(storage endpoint.ConfigStorage) error {
 		o.labelProperty.Store(cfg.LabelProperty)
 		o.keyspace.Store(&cfg.Keyspace)
 		o.microservice.Store(&cfg.Microservice)
+		if IsValidLeaderLease(cfg.LeaderLease) {
+			o.SetLeaderLease(cfg.LeaderLease)
+		}
 		o.storeConfig.Store(&cfg.StoreConfig)
 		o.SetClusterVersion(&cfg.ClusterVersion)
 	}
 	return nil
+}
+
+// ReloadLeaderLease reloads only the PD leader lease timeout from storage.
+func (o *PersistOptions) ReloadLeaderLease(storage endpoint.ConfigStorage) error {
+	cfg, isExist, err := loadPersistedConfig(storage)
+	if err != nil {
+		return err
+	}
+	if isExist && IsValidLeaderLease(cfg.LeaderLease) {
+		o.SetLeaderLease(cfg.LeaderLease)
+	}
+	return nil
+}
+
+func loadPersistedConfig(storage endpoint.ConfigStorage) (*persistedConfig, bool, error) {
+	cfg := &persistedConfig{Config: &Config{}}
+	// Pass nil to initialize cfg to default values (all items undefined)
+	if err := cfg.Adjust(nil, true); err != nil {
+		return nil, false, err
+	}
+	isExist, err := storage.LoadConfig(cfg)
+	return cfg, isExist, err
+}
+
+// IsValidLeaderLease returns whether the given PD leader lease timeout is valid.
+func IsValidLeaderLease(lease int64) bool {
+	return lease > 0
 }
 
 func adjustScheduleCfg(scheduleCfg *sc.ScheduleConfig) {
