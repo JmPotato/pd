@@ -651,7 +651,7 @@ func (gta *GlobalTSOAllocator) campaignLeader() {
 	// check expected primary and watch the primary.
 	exitPrimary := make(chan struct{})
 	lease, err := mcsutils.KeepExpectedPrimaryAlive(ctx, gta.member.Client(), exitPrimary,
-		gta.am.leaderLease, gta.member.GetLeaderPath(), gta.member.MemberValue(), constant.TSOServiceName)
+		gta.am.leaderLease, gta.member.GetLeaderPath(), gta.member.MemberValue(), constant.TSOServiceName, gta.getGroupID())
 	if err != nil {
 		log.Error("prepare tso primary watch error", errs.ZapError(err))
 		return

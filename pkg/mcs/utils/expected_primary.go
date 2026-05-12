@@ -78,15 +78,28 @@ func markExpectedPrimaryFlag(client *clientv3.Client, primaryPath string, leader
 // - leader lease expired.
 // ONLY primary called this function.
 func KeepExpectedPrimaryAlive(ctx context.Context, cli *clientv3.Client, exitPrimary chan<- struct{},
-	leaseTimeout int64, leaderPath, memberValue, service string) (*election.Lease, error) {
-	log.Info("primary start to watch the expected primary", zap.String("service", service), zap.String("primary-value", memberValue))
+	leaseTimeout int64, leaderPath, memberValue, service string, groupID uint32) (*election.Lease, error) {
+	log.Info("primary start to watch the expected primary",
+		zap.String("service", service),
+		zap.Uint32("group-id", groupID),
+		zap.String("primary-value", memberValue))
+	isTSO := service == constant.TSOServiceName
 	service = fmt.Sprintf("%s expected primary", service)
+	// For TSO, include the keyspace group ID in the purpose so per-keyspace-group
+	// expected primary leases get distinct Prometheus labels and distinct slots
+	// in localTTLRemainingCollector. A single TSO process can be primary for
+	// multiple keyspace groups; without the group ID suffix their leases all
+	// collapse onto one series. Non-TSO services only ever have one expected
+	// primary lease, so the group ID suffix would just be noise (0).
+	if isTSO {
+		service = fmt.Sprintf("%s %05d", service, groupID)
+	}
 	lease := election.NewLease(cli, service)
 	if err := lease.Grant(leaseTimeout); err != nil {
 		return nil, err
 	}
 
-	revision, err := markExpectedPrimaryFlag(cli, leaderPath, memberValue, lease.ID.Load().(clientv3.LeaseID))
+	revision, err := markExpectedPrimaryFlag(cli, leaderPath, memberValue, lease.GetID())
 	if err != nil {
 		log.Error("mark expected primary error", errs.ZapError(err))
 		return nil, err
