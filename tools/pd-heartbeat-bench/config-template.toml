@@ -1,11 +1,20 @@
 round = 0
 
 store-count = 100
-region-count = 2000000
+region-count = 8159500
 
 replica = 3
+extra-peer-count = 0
+extra-peer-ratio = 0.0
+extra-peer-role = "learner"
 
-leader-update-ratio = 0.06
+region-heartbeat-qps = 0
+store-heartbeat-qps = 10
+report-min-resolved-ts-qps = 99
+report-buckets-streams = 100
+report-buckets-interval-ms = 1000
+
+leader-update-ratio = 0.0
 epoch-update-ratio = 0.0
 space-update-ratio = 0.0
 flow-update-ratio = 0.0

@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -50,6 +51,8 @@ import (
 	"github.com/tikv/pd/tools/pd-heartbeat-bench/metrics"
 	"go.etcd.io/etcd/pkg/v3/report"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -68,6 +71,24 @@ var (
 	clusterID  uint64
 	maxVersion uint64 = 1
 )
+
+type reportBucketsClient interface {
+	Send(*pdpb.ReportBucketsRequest) error
+	CloseAndRecv() (*pdpb.ReportBucketsResponse, error)
+}
+
+type reportBucketsStreamFactory func(context.Context) (reportBucketsClient, error)
+
+type bucketReporterStatus struct {
+	activeStreams atomic.Int64
+	sendSuccess   atomic.Int64
+	sendErrors    atomic.Int64
+	reconnects    atomic.Int64
+}
+
+func newBucketReporterStatus() *bucketReporterStatus {
+	return &bucketReporterStatus{}
+}
 
 func newClient(ctx context.Context, cfg *config.Config) (pdpb.PDClient, error) {
 	tlsConfig, err := cfg.Security.ToTLSConfig()
@@ -151,6 +172,7 @@ func bootstrap(ctx context.Context, cli pdpb.PDClient) {
 }
 
 func putStores(ctx context.Context, cfg *config.Config, cli pdpb.PDClient, stores *Stores) {
+	storeHeartbeatInterval := intervalForAggregateQPS(cfg.StoreHeartbeatQPS, cfg.StoreCount, storeReportInterval*time.Second)
 	for i := uint64(1); i <= uint64(cfg.StoreCount); i++ {
 		store := &metapb.Store{
 			Id:      i,
@@ -167,7 +189,7 @@ func putStores(ctx context.Context, cfg *config.Config, cli pdpb.PDClient, store
 			log.Fatal("failed to put store", zap.Uint64("store-id", i), zap.String("err", resp.GetHeader().GetError().String()))
 		}
 		go func(ctx context.Context, storeID uint64) {
-			heartbeatTicker := time.NewTicker(10 * time.Second)
+			heartbeatTicker := time.NewTicker(storeHeartbeatInterval)
 			defer heartbeatTicker.Stop()
 			for {
 				select {
@@ -179,6 +201,28 @@ func putStores(ctx context.Context, cfg *config.Config, cli pdpb.PDClient, store
 			}
 		}(ctx, i)
 	}
+}
+
+func extraPeerCountForRegion(cfg *config.Config, regionIndex int) int {
+	extraPeerCount := cfg.ExtraPeerCount
+	if cfg.ExtraPeerRatio > 0 {
+		extraPeerCount = int(float64(cfg.RegionCount) * cfg.ExtraPeerRatio)
+	}
+	if extraPeerCount <= 0 {
+		return 0
+	}
+	base := extraPeerCount / cfg.RegionCount
+	if regionIndex < extraPeerCount%cfg.RegionCount {
+		base++
+	}
+	return base
+}
+
+func extraPeerRole(role string) metapb.PeerRole {
+	if role == "learner" {
+		return metapb.PeerRole_Learner
+	}
+	return metapb.PeerRole_Voter
 }
 
 // Regions simulates all regions to heartbeat.
@@ -228,9 +272,18 @@ func (rs *Regions) init(cfg *config.Config) {
 			region.Region.EndKey = []byte("")
 		}
 
-		peers := make([]*metapb.Peer, 0, cfg.Replica)
+		peers := make([]*metapb.Peer, 0, cfg.Replica+extraPeerCountForRegion(cfg, i))
 		for j := range cfg.Replica {
 			peers = append(peers, &metapb.Peer{Id: id, StoreId: uint64((i+j)%cfg.StoreCount + 1)})
+			id += 1
+		}
+		extraPeers := extraPeerCountForRegion(cfg, i)
+		for j := range extraPeers {
+			peers = append(peers, &metapb.Peer{
+				Id:      id,
+				StoreId: uint64((i+cfg.Replica+j)%cfg.StoreCount + 1),
+				Role:    extraPeerRole(cfg.ExtraPeerRole),
+			})
 			id += 1
 		}
 
@@ -461,8 +514,190 @@ func pick(slice []int, total int, ratio float64) []int {
 	return append(slice[:0:0], slice[0:int(float64(total)*ratio)]...)
 }
 
+type minResolvedTSReportFunc func(context.Context, uint64) error
+
+func reportMinResolvedTSForStores(ctx context.Context, storeCount int, report minResolvedTSReportFunc) {
+	wg := &sync.WaitGroup{}
+	for i := 1; i <= storeCount; i++ {
+		id := uint64(i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := report(ctx, id); err != nil {
+				log.Error("send resolved TS error", zap.Uint64("store-id", id), zap.Error(err))
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func runMinResolvedTSReporter(
+	ctx context.Context,
+	storeCount int,
+	interval time.Duration,
+	report minResolvedTSReportFunc,
+) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resolvedTSTicker := time.NewTicker(interval)
+		defer resolvedTSTicker.Stop()
+		for {
+			select {
+			case <-resolvedTSTicker.C:
+				reportMinResolvedTSForStores(ctx, storeCount, report)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return done
+}
+
+func intervalForAggregateQPS(qps int, units int, fallback time.Duration) time.Duration {
+	if qps <= 0 || units <= 0 {
+		return fallback
+	}
+	interval := time.Duration(units) * time.Second / time.Duration(qps)
+	if interval < time.Millisecond {
+		return time.Millisecond
+	}
+	return interval
+}
+
+func buildReportBucketsRequest(region *pdpb.RegionHeartbeatRequest, periodMs uint64) *pdpb.ReportBucketsRequest {
+	return &pdpb.ReportBucketsRequest{
+		Header:      header(),
+		RegionEpoch: region.GetRegion().GetRegionEpoch(),
+		Buckets: &metapb.Buckets{
+			RegionId:   region.GetRegion().GetId(),
+			Version:    uint64(time.Now().UnixNano()),
+			Keys:       [][]byte{region.GetRegion().GetStartKey(), region.GetRegion().GetEndKey()},
+			PeriodInMs: periodMs,
+			Stats: &metapb.BucketStats{
+				ReadBytes:  []uint64{1},
+				ReadKeys:   []uint64{1},
+				ReadQps:    []uint64{1},
+				WriteBytes: []uint64{1},
+				WriteKeys:  []uint64{1},
+				WriteQps:   []uint64{1},
+			},
+		},
+	}
+}
+
+func startReportBucketsWorkers(
+	ctx context.Context,
+	streamCount int,
+	interval time.Duration,
+	regions *Regions,
+	status *bucketReporterStatus,
+	factory reportBucketsStreamFactory,
+) {
+	if streamCount <= 0 {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	for i := 0; i < streamCount; i++ {
+		workerID := i
+		go runReportBucketsWorker(ctx, workerID, interval, regions, status, factory)
+	}
+}
+
+func runReportBucketsWorker(
+	ctx context.Context,
+	workerID int,
+	interval time.Duration,
+	regions *Regions,
+	status *bucketReporterStatus,
+	factory reportBucketsStreamFactory,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if err := runReportBucketsStream(ctx, workerID, interval, regions, status, factory); err != nil {
+			if isExpectedReportBucketsShutdown(ctx, err) {
+				return
+			}
+			status.reconnects.Add(1)
+			log.Error("report buckets stream disconnected", zap.Int("worker-id", workerID), zap.Error(err))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func isExpectedReportBucketsShutdown(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() == nil {
+		return false
+	}
+	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Cause(err) == context.Canceled || errors.Cause(err) == context.DeadlineExceeded {
+		return true
+	}
+	code := status.Code(err)
+	return code == codes.Canceled || code == codes.DeadlineExceeded
+}
+
+func runReportBucketsStream(
+	ctx context.Context,
+	workerID int,
+	interval time.Duration,
+	regions *Regions,
+	status *bucketReporterStatus,
+	factory reportBucketsStreamFactory,
+) error {
+	stream, err := factory(ctx)
+	if err != nil {
+		return err
+	}
+	status.activeStreams.Add(1)
+	defer status.activeStreams.Add(-1)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	seq := workerID
+	for {
+		if len(regions.regions) == 0 {
+			return nil
+		}
+		region := regions.regions[seq%len(regions.regions)]
+		req := buildReportBucketsRequest(region, uint64(interval/time.Millisecond))
+		if err := stream.Send(req); err != nil {
+			status.sendErrors.Add(1)
+			return err
+		}
+		status.sendSuccess.Add(1)
+		seq += 1
+		select {
+		case <-ctx.Done():
+			_, err := stream.CloseAndRecv()
+			if err != nil && !stderrors.Is(err, context.Canceled) && !stderrors.Is(err, io.EOF) {
+				return err
+			}
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func newReportBucketsStreamFactory(cli pdpb.PDClient) reportBucketsStreamFactory {
+	return func(ctx context.Context) (reportBucketsClient, error) {
+		return cli.ReportBuckets(ctx)
+	}
+}
+
 func main() {
-	rand.New(rand.NewSource(0)) // Ensure consistent behavior multiple times
 	statistics.Denoising = false
 	cfg := config.NewConfig()
 	err := cfg.Parse(os.Args[1:])
@@ -526,10 +761,26 @@ func main() {
 	header := &pdpb.RequestHeader{
 		ClusterId: clusterID,
 	}
-	heartbeatTicker := time.NewTicker(regionReportInterval * time.Second)
+	heartbeatTicker := time.NewTicker(intervalForAggregateQPS(cfg.RegionHeartbeatQPS, cfg.RegionCount, regionReportInterval*time.Second))
 	defer heartbeatTicker.Stop()
-	resolvedTSTicker := time.NewTicker(time.Second)
-	defer resolvedTSTicker.Stop()
+	runMinResolvedTSReporter(ctx, cfg.StoreCount, intervalForAggregateQPS(cfg.ReportMinResolvedTSQPS, cfg.StoreCount, time.Second), func(ctx context.Context, id uint64) error {
+		cli := clis[id]
+		_, err := cli.ReportMinResolvedTS(ctx, &pdpb.ReportMinResolvedTsRequest{
+			Header:        header,
+			StoreId:       id,
+			MinResolvedTs: uint64(time.Now().Unix()),
+		})
+		return err
+	})
+	bucketStatus := newBucketReporterStatus()
+	startReportBucketsWorkers(
+		ctx,
+		cfg.ReportBucketsStreams,
+		time.Duration(cfg.ReportBucketsIntervalMS)*time.Millisecond,
+		regions,
+		bucketStatus,
+		newReportBucketsStreamFactory(cli),
+	)
 	withMetric := metrics.InitMetric2Collect(cfg.MetricsAddr)
 	for {
 		select {
@@ -562,26 +813,6 @@ func main() {
 			metrics.CollectRegionAndStoreStats(&stats, &since)
 			regions.update(cfg, options)
 			go stores.update(regions) // update stores in background, unusually region heartbeat is slower than store update.
-		case <-resolvedTSTicker.C:
-			wg := &sync.WaitGroup{}
-			for i := 1; i <= cfg.StoreCount; i++ {
-				id := uint64(i)
-				wg.Add(1)
-				go func(wg *sync.WaitGroup, id uint64) {
-					defer wg.Done()
-					cli := clis[id]
-					_, err := cli.ReportMinResolvedTS(ctx, &pdpb.ReportMinResolvedTsRequest{
-						Header:        header,
-						StoreId:       id,
-						MinResolvedTs: uint64(time.Now().Unix()),
-					})
-					if err != nil {
-						log.Error("send resolved TS error", zap.Uint64("store-id", id), zap.Error(err))
-						return
-					}
-				}(wg, id)
-			}
-			wg.Wait()
 		case <-ctx.Done():
 			log.Info("got signal to exit")
 			switch sig {

@@ -1,6 +1,8 @@
 package config
 
 import (
+	"math"
+	"strings"
 	"sync/atomic"
 
 	"github.com/BurntSushi/toml"
@@ -54,6 +56,16 @@ type Config struct {
 	Sample            bool    `toml:"sample" json:"sample"`
 	Round             int     `toml:"round" json:"round"`
 	MetricsAddr       string  `toml:"metrics-addr" json:"metrics-addr"`
+
+	ExtraPeerCount int     `toml:"extra-peer-count" json:"extra-peer-count"`
+	ExtraPeerRatio float64 `toml:"extra-peer-ratio" json:"extra-peer-ratio"`
+	ExtraPeerRole  string  `toml:"extra-peer-role" json:"extra-peer-role"`
+
+	RegionHeartbeatQPS      int `toml:"region-heartbeat-qps" json:"region-heartbeat-qps"`
+	StoreHeartbeatQPS       int `toml:"store-heartbeat-qps" json:"store-heartbeat-qps"`
+	ReportMinResolvedTSQPS  int `toml:"report-min-resolved-ts-qps" json:"report-min-resolved-ts-qps"`
+	ReportBucketsStreams    int `toml:"report-buckets-streams" json:"report-buckets-streams"`
+	ReportBucketsIntervalMS int `toml:"report-buckets-interval-ms" json:"report-buckets-interval-ms"`
 }
 
 // NewConfig return a set of settings.
@@ -70,6 +82,14 @@ func NewConfig() *Config {
 	fs.StringVar(&cfg.Security.CertPath, "cert", "", "path of file that contains X509 certificate in PEM format")
 	fs.StringVar(&cfg.Security.KeyPath, "key", "", "path of file that contains X509 key in PEM format")
 	fs.Uint64Var(&cfg.InitEpochVer, "epoch-ver", 1, "the initial epoch version value")
+	fs.IntVar(&cfg.ExtraPeerCount, "extra-peer-count", 0, "extra synthetic peers to add across regions")
+	fs.Float64Var(&cfg.ExtraPeerRatio, "extra-peer-ratio", 0, "extra synthetic peer ratio by region count")
+	fs.StringVar(&cfg.ExtraPeerRole, "extra-peer-role", "", "extra synthetic peer role: learner or voter")
+	fs.IntVar(&cfg.RegionHeartbeatQPS, "region-heartbeat-qps", 0, "aggregate region heartbeat qps target")
+	fs.IntVar(&cfg.StoreHeartbeatQPS, "store-heartbeat-qps", 0, "aggregate store heartbeat qps target")
+	fs.IntVar(&cfg.ReportMinResolvedTSQPS, "report-min-resolved-ts-qps", 0, "aggregate ReportMinResolvedTS qps target")
+	fs.IntVar(&cfg.ReportBucketsStreams, "report-buckets-streams", 0, "active ReportBuckets stream count")
+	fs.IntVar(&cfg.ReportBucketsIntervalMS, "report-buckets-interval-ms", 1000, "per-stream ReportBuckets send interval in milliseconds")
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", "127.0.0.1:9090", "the address to pull metrics")
 
 	return cfg
@@ -111,49 +131,70 @@ func (c *Config) Adjust(meta *toml.MetaData) {
 	if len(c.Log.Format) == 0 {
 		c.Log.Format = defaultLogFormat
 	}
-	if !meta.IsDefined("round") {
+	c.PDAddr = normalizePDAddr(c.PDAddr)
+	if !isDefined(meta, "round") {
 		configutil.AdjustInt(&c.Round, defaultRound)
 	}
 
-	if !meta.IsDefined("store-count") {
+	if !isDefined(meta, "store-count") {
 		configutil.AdjustInt(&c.StoreCount, defaultStoreCount)
 	}
-	if !meta.IsDefined("region-count") {
+	if !isDefined(meta, "region-count") {
 		configutil.AdjustInt(&c.RegionCount, defaultRegionCount)
 	}
 
-	if !meta.IsDefined("hot-store-count") {
+	if !isDefined(meta, "hot-store-count") {
 		configutil.AdjustInt(&c.HotStoreCount, defaultHotStoreCount)
 	}
-	if !meta.IsDefined("replica") {
+	if !isDefined(meta, "replica") {
 		configutil.AdjustInt(&c.Replica, defaultReplica)
 	}
 
-	if !meta.IsDefined("leader-update-ratio") {
+	if !isDefined(meta, "leader-update-ratio") {
 		configutil.AdjustFloat64(&c.LeaderUpdateRatio, defaultLeaderUpdateRatio)
 	}
-	if !meta.IsDefined("epoch-update-ratio") {
+	if !isDefined(meta, "epoch-update-ratio") {
 		configutil.AdjustFloat64(&c.EpochUpdateRatio, defaultEpochUpdateRatio)
 	}
-	if !meta.IsDefined("space-update-ratio") {
+	if !isDefined(meta, "space-update-ratio") {
 		configutil.AdjustFloat64(&c.SpaceUpdateRatio, defaultSpaceUpdateRatio)
 	}
-	if !meta.IsDefined("flow-update-ratio") {
+	if !isDefined(meta, "flow-update-ratio") {
 		configutil.AdjustFloat64(&c.FlowUpdateRatio, defaultFlowUpdateRatio)
 	}
-	if !meta.IsDefined("report-ratio") {
+	if !isDefined(meta, "report-ratio") {
 		configutil.AdjustFloat64(&c.ReportRatio, defaultReportRatio)
 	}
-	if !meta.IsDefined("sample") {
+	if !isDefined(meta, "sample") {
 		c.Sample = defaultSample
 	}
-	if !meta.IsDefined("epoch-ver") {
+	if !isDefined(meta, "epoch-ver") {
 		c.InitEpochVer = defaultInitialVersion
 	}
 }
 
+func isDefined(meta *toml.MetaData, key string) bool {
+	return meta != nil && meta.IsDefined(key)
+}
+
+func normalizePDAddr(addr string) string {
+	if addr == "" || strings.Contains(addr, "://") {
+		return addr
+	}
+	return "http://" + addr
+}
+
 // Validate is used to validate configurations
 func (c *Config) Validate() error {
+	if c.StoreCount <= 0 {
+		return errors.Errorf("store-count must be positive")
+	}
+	if c.RegionCount <= 0 {
+		return errors.Errorf("region-count must be positive")
+	}
+	if c.Replica <= 0 {
+		return errors.Errorf("replica must be positive")
+	}
 	if c.HotStoreCount < 0 || c.HotStoreCount > c.StoreCount {
 		return errors.Errorf("hot-store-count must be in [0, store-count]")
 	}
@@ -171,6 +212,46 @@ func (c *Config) Validate() error {
 	}
 	if c.FlowUpdateRatio > c.ReportRatio || c.FlowUpdateRatio < 0 {
 		return errors.Errorf("flow-update-ratio can not be negative or larger than report-ratio")
+	}
+	if c.ExtraPeerCount < 0 {
+		return errors.Errorf("extra-peer-count can not be negative")
+	}
+	if c.ExtraPeerRatio < 0 {
+		return errors.Errorf("extra-peer-ratio can not be negative")
+	}
+	if c.ExtraPeerCount > 0 && c.ExtraPeerRatio > 0 {
+		return errors.Errorf("only one of extra-peer-count and extra-peer-ratio can be configured")
+	}
+	extraPeerCount := c.ExtraPeerCount
+	if c.ExtraPeerRatio > 0 {
+		extraPeerCount = int(math.Floor(float64(c.RegionCount) * c.ExtraPeerRatio))
+	}
+	if extraPeerCount > 0 && c.ExtraPeerRole == "" {
+		c.ExtraPeerRole = "learner"
+	}
+	switch c.ExtraPeerRole {
+	case "", "learner", "voter":
+	default:
+		return errors.Errorf("extra-peer-role must be learner or voter")
+	}
+	maxInt := int(^uint(0) >> 1)
+	if c.RegionCount > (maxInt-extraPeerCount)/c.Replica {
+		return errors.Errorf("total peer count overflows int")
+	}
+	if c.RegionHeartbeatQPS < 0 {
+		return errors.Errorf("region-heartbeat-qps can not be negative")
+	}
+	if c.StoreHeartbeatQPS < 0 {
+		return errors.Errorf("store-heartbeat-qps can not be negative")
+	}
+	if c.ReportMinResolvedTSQPS < 0 {
+		return errors.Errorf("report-min-resolved-ts-qps can not be negative")
+	}
+	if c.ReportBucketsStreams < 0 {
+		return errors.Errorf("report-buckets-streams can not be negative")
+	}
+	if c.ReportBucketsIntervalMS < 0 {
+		return errors.Errorf("report-buckets-interval-ms can not be negative")
 	}
 	return nil
 }

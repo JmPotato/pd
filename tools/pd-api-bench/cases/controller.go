@@ -20,11 +20,13 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/log"
 	pd "github.com/tikv/pd/client"
 	pdHttp "github.com/tikv/pd/client/http"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 var base = int64(time.Second) / int64(time.Microsecond)
@@ -37,9 +39,10 @@ type Coordinator struct {
 	gRPCClients []pd.Client
 	etcdClients []*clientv3.Client
 
-	http map[string]*httpController
-	grpc map[string]*gRPCController
-	etcd map[string]*etcdController
+	http       map[string]*httpController
+	grpc       map[string]*gRPCController
+	directGRPC map[string]*directGRPCController
+	etcd       map[string]*etcdController
 
 	mu sync.RWMutex
 }
@@ -53,6 +56,7 @@ func NewCoordinator(ctx context.Context, httpClients []pdHttp.Client, gRPCClient
 		etcdClients: etcdClients,
 		http:        make(map[string]*httpController),
 		grpc:        make(map[string]*gRPCController),
+		directGRPC:  make(map[string]*directGRPCController),
 		etcd:        make(map[string]*etcdController),
 	}
 }
@@ -72,6 +76,9 @@ func (c *Coordinator) GetGRPCCase(name string) (*Config, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if controller, ok := c.grpc[name]; ok {
+		return controller.getConfig(), nil
+	}
+	if controller, ok := c.directGRPC[name]; ok {
 		return controller.getConfig(), nil
 	}
 	return nil, errors.Errorf("case %v does not exist", name)
@@ -106,6 +113,9 @@ func (c *Coordinator) GetAllGRPCCases() map[string]*Config {
 	for name, c := range c.grpc {
 		ret[name] = c.getConfig()
 	}
+	for name, c := range c.directGRPC {
+		ret[name] = c.getConfig()
+	}
 	return ret
 }
 
@@ -131,10 +141,7 @@ func (c *Coordinator) SetHTTPCase(name string, cfg *Config) error {
 			c.http[name] = controller
 		}
 		controller.stop()
-		controller.setQPS(cfg.QPS)
-		if cfg.Burst > 0 {
-			controller.setBurst(cfg.Burst)
-		}
+		applyCaseConfig(controller.HTTPCase, cfg)
 		controller.run()
 	} else {
 		return errors.Errorf("HTTP case %s not implemented", name)
@@ -153,10 +160,16 @@ func (c *Coordinator) SetGRPCCase(name string, cfg *Config) error {
 			c.grpc[name] = controller
 		}
 		controller.stop()
-		controller.setQPS(cfg.QPS)
-		if cfg.Burst > 0 {
-			controller.setBurst(cfg.Burst)
+		applyCaseConfig(controller.GRPCCase, cfg)
+		controller.run()
+	} else if fn, ok := DirectGRPCCaseFnMap[name]; ok {
+		var controller *directGRPCController
+		if controller, ok = c.directGRPC[name]; !ok {
+			controller = newDirectGRPCController(c.ctx, c.gRPCClients, fn)
+			c.directGRPC[name] = controller
 		}
+		controller.stop()
+		applyCaseConfig(controller.DirectGRPCCase, cfg)
 		controller.run()
 	} else {
 		return errors.Errorf("gRPC case %s not implemented", name)
@@ -175,10 +188,7 @@ func (c *Coordinator) SetEtcdCase(name string, cfg *Config) error {
 			c.etcd[name] = controller
 		}
 		controller.stop()
-		controller.setQPS(cfg.QPS)
-		if cfg.Burst > 0 {
-			controller.setBurst(cfg.Burst)
-		}
+		applyCaseConfig(controller.EtcdCase, cfg)
 		controller.run()
 	} else {
 		return errors.Errorf("etcd case %s not implemented", name)
@@ -321,6 +331,90 @@ func (c *gRPCController) stop() {
 	c.cancel()
 	c.cancel = nil
 	c.wg.Wait()
+}
+
+type directGRPCController struct {
+	DirectGRPCCase
+	clients []pd.Client
+	pctx    context.Context
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	wg sync.WaitGroup
+}
+
+func newDirectGRPCController(ctx context.Context, clis []pd.Client, fn DirectGRPCCreateFn) *directGRPCController {
+	return &directGRPCController{
+		pctx:           ctx,
+		clients:        clis,
+		DirectGRPCCase: fn(),
+	}
+}
+
+func (c *directGRPCController) run() {
+	if c.getQPS() <= 0 || c.cancel != nil {
+		return
+	}
+	c.ctx, c.cancel = context.WithCancel(c.pctx)
+	qps := c.getQPS()
+	burst := c.getBurst()
+	cliNum := int64(len(c.clients))
+	tt := time.Duration(base*burst*cliNum/qps) * time.Microsecond
+	log.Info("begin to run direct gRPC case", zap.String("case", c.getName()), zap.Int64("qps", qps), zap.Int64("burst", burst), zap.Duration("interval", tt))
+	for _, cli := range c.clients {
+		c.wg.Add(1)
+		go func(cli pd.Client) {
+			defer c.wg.Done()
+			c.wg.Add(int(burst))
+			for range burst {
+				go func() {
+					defer c.wg.Done()
+					ticker := time.NewTicker(tt)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-ticker.C:
+							pdClient, healthClient, err := buildDirectClients(cli)
+							if err != nil {
+								log.Error("create direct gRPC client failed", zap.String("case", c.getName()), zap.Error(err))
+								continue
+							}
+							err = c.unaryDirect(c.ctx, pdClient, healthClient)
+							if err != nil {
+								log.Error("meet error when doing direct gRPC request", zap.String("case", c.getName()), zap.Error(err))
+							}
+						case <-c.ctx.Done():
+							log.Info("got signal to exit running direct gRPC case")
+							return
+						}
+					}
+				}()
+			}
+		}(cli)
+	}
+}
+
+func (c *directGRPCController) stop() {
+	if c.cancel == nil {
+		return
+	}
+	c.cancel()
+	c.cancel = nil
+	c.wg.Wait()
+}
+
+func buildDirectClients(cli pd.Client) (pdpb.PDClient, healthpb.HealthClient, error) {
+	sd := cli.GetServiceDiscovery()
+	conn := sd.GetServingEndpointClientConn()
+	if conn == nil {
+		var err error
+		conn, err = sd.GetOrCreateGRPCConn(sd.GetServingURL())
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return pdpb.NewPDClient(conn), healthpb.NewHealthClient(conn), nil
 }
 
 type etcdController struct {

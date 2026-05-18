@@ -25,17 +25,22 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/influxdata/tdigest"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/log"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -60,6 +65,11 @@ var (
 	enableFaultInjection           = flag.Bool("enable-fault-injection", false, "whether enable fault injection")
 	faultInjectionRate             = flag.Float64("fault-injection-rate", 0.01, "the failure rate [0.0001, 1]. 0.01 means 1% failure rate")
 	maxTSOSendIntervalMilliseconds = flag.Int("max-send-interval-ms", 0, "max tso send interval in milliseconds, 60s by default")
+	logicalTSOQPS                  = flag.Int("logical-tso-qps", 0, "aggregate logical TSO qps target in direct stream mode")
+	tidbClientInstances            = flag.Int("tidb-client-instances", 1, "TiDB client instance count in direct stream mode")
+	tsoStreamsPerClient            = flag.Int("tso-streams-per-client", 1, "TSO streams per TiDB client in direct stream mode")
+	maxTotalTSOStreams             = flag.Int("max-total-tso-streams", 0, "maximum total TSO streams in direct stream mode")
+	directStreamMode               = flag.Bool("direct-stream-mode", false, "use long-lived raw PD.Tso streams instead of pd.Client.GetLocalTS")
 	keyspaceID                     = flag.Uint("keyspace-id", 0, "the id of the keyspace to access")
 	keyspaceName                   = flag.String("keyspace-name", "", "the name of the keyspace to access")
 	useTSOServerProxy              = flag.Bool("use-tso-server-proxy", false, "whether send tso requests to tso server proxy instead of tso service directly")
@@ -67,6 +77,57 @@ var (
 )
 
 var promServer *httptest.Server
+
+type tsoStreamConfig struct {
+	DirectStreamMode    bool
+	LogicalTSOQPS       int
+	TiDBClientInstances int
+	TSOStreamsPerClient int
+	MaxTotalTSOStreams  int
+}
+
+func tsoStreamConfigFromFlags() tsoStreamConfig {
+	return tsoStreamConfig{
+		DirectStreamMode:    *directStreamMode,
+		LogicalTSOQPS:       *logicalTSOQPS,
+		TiDBClientInstances: *tidbClientInstances,
+		TSOStreamsPerClient: *tsoStreamsPerClient,
+		MaxTotalTSOStreams:  *maxTotalTSOStreams,
+	}
+}
+
+func (c tsoStreamConfig) TotalStreams() int {
+	if !c.DirectStreamMode {
+		return 0
+	}
+	return c.TiDBClientInstances * c.TSOStreamsPerClient
+}
+
+func (c tsoStreamConfig) Validate() error {
+	if c.LogicalTSOQPS < 0 {
+		return errors.Errorf("logical-tso-qps can not be negative")
+	}
+	if !c.DirectStreamMode {
+		return nil
+	}
+	if c.TiDBClientInstances <= 0 {
+		return errors.Errorf("tidb-client-instances must be positive")
+	}
+	if c.TSOStreamsPerClient <= 0 {
+		return errors.Errorf("tso-streams-per-client must be positive")
+	}
+	if c.MaxTotalTSOStreams > 0 && c.TotalStreams() > c.MaxTotalTSOStreams {
+		return errors.Errorf("total TSO streams %d exceeds max-total-tso-streams %d", c.TotalStreams(), c.MaxTotalTSOStreams)
+	}
+	return nil
+}
+
+type directTSOStats struct {
+	activeStreams atomic.Int64
+	successCount  atomic.Int64
+	reconnects    atomic.Int64
+	errors        atomic.Int64
+}
 
 func collectMetrics(server *httptest.Server) string {
 	time.Sleep(1100 * time.Millisecond)
@@ -93,7 +154,179 @@ func main() {
 
 	for i := range *count {
 		fmt.Printf("\nStart benchmark #%d, duration: %+vs\n", i, duration.Seconds())
-		bench(ctx)
+		if *directStreamMode {
+			benchDirectTSO(ctx)
+		} else {
+			bench(ctx)
+		}
+	}
+}
+
+func benchDirectTSO(mainCtx context.Context) {
+	cfg := tsoStreamConfigFromFlags()
+	if err := cfg.Validate(); err != nil {
+		log.Fatal("invalid direct TSO stream config", zap.Error(err))
+	}
+	fmt.Printf("Create %d TiDB-like client(s), %d total TSO stream(s), logical TSO qps target: %d\n",
+		cfg.TiDBClientInstances, cfg.TotalStreams(), cfg.LogicalTSOQPS)
+	pdClients := make([]pd.Client, cfg.TiDBClientInstances)
+	for idx := range pdClients {
+		pdCli, err := createPDClient(mainCtx)
+		if err != nil {
+			log.Fatal(fmt.Sprintf("create pd client #%d failed: %v", idx, err))
+		}
+		pdClients[idx] = pdCli
+	}
+	defer func() {
+		for _, pdCli := range pdClients {
+			pdCli.Close()
+		}
+	}()
+
+	clusterID := pdClients[0].GetClusterID(mainCtx)
+	limiter := newLogicalTSOLimiter(cfg.LogicalTSOQPS, cfg.TotalStreams())
+	stats := &directTSOStats{}
+	ctx, cancel := context.WithCancel(mainCtx)
+	defer cancel()
+	var streamWG sync.WaitGroup
+	for clientIdx, pdCli := range pdClients {
+		for streamIdx := 0; streamIdx < cfg.TSOStreamsPerClient; streamIdx++ {
+			streamWG.Add(1)
+			go runDirectTSOStream(ctx, &streamWG, pdCli, clusterID, limiter, stats, clientIdx, streamIdx)
+		}
+	}
+	statsDone := runDirectTSOStatsPrinter(ctx, stats, *interval, os.Stdout)
+
+	timer := time.NewTimer(*duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+	cancel()
+	streamWG.Wait()
+	<-statsDone
+	fmt.Printf("Direct TSO streams: active=%d success=%d reconnect=%d error=%d\n",
+		stats.activeStreams.Load(), stats.successCount.Load(), stats.reconnects.Load(), stats.errors.Load())
+}
+
+func runDirectTSOStatsPrinter(ctx context.Context, stats *directTSOStats, interval time.Duration, writer io.Writer) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		var last int64
+		for {
+			select {
+			case <-ticker.C:
+				last = writeDirectTSOIntervalStats(writer, stats, last)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return done
+}
+
+func writeDirectTSOIntervalStats(writer io.Writer, stats *directTSOStats, lastSuccess int64) int64 {
+	currentSuccess := stats.successCount.Load()
+	fmt.Fprintf(writer, "count:%d, active:%d, reconnect:%d, error:%d\n",
+		currentSuccess-lastSuccess,
+		stats.activeStreams.Load(),
+		stats.reconnects.Load(),
+		stats.errors.Load())
+	return currentSuccess
+}
+
+func newLogicalTSOLimiter(qps int, streams int) *rate.Limiter {
+	if qps <= 0 {
+		return rate.NewLimiter(rate.Inf, max(1, streams))
+	}
+	return rate.NewLimiter(rate.Limit(qps), max(1, streams))
+}
+
+func runDirectTSOStream(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	pdCli pd.Client,
+	clusterID uint64,
+	limiter *rate.Limiter,
+	stats *directTSOStats,
+	clientIdx int,
+	streamIdx int,
+) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if err := runOneDirectTSOStream(ctx, pdCli, clusterID, limiter, stats); err != nil {
+			if isExpectedDirectTSOShutdown(ctx, err) {
+				return
+			}
+			stats.reconnects.Add(1)
+			stats.errors.Add(1)
+			log.Error("direct TSO stream disconnected", zap.Int("client", clientIdx), zap.Int("stream", streamIdx), zap.Error(err))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func isExpectedDirectTSOShutdown(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() == nil {
+		return false
+	}
+	if errors.Cause(err) == context.Canceled || errors.Cause(err) == context.DeadlineExceeded {
+		return true
+	}
+	code := status.Code(err)
+	return code == codes.Canceled || code == codes.DeadlineExceeded
+}
+
+func runOneDirectTSOStream(
+	ctx context.Context,
+	pdCli pd.Client,
+	clusterID uint64,
+	limiter *rate.Limiter,
+	stats *directTSOStats,
+) error {
+	conn := pdCli.GetServiceDiscovery().GetServingEndpointClientConn()
+	if conn == nil {
+		var err error
+		conn, err = pdCli.GetServiceDiscovery().GetOrCreateGRPCConn(pdCli.GetServiceDiscovery().GetServingURL())
+		if err != nil {
+			return err
+		}
+	}
+	stream, err := pdpb.NewPDClient(conn).Tso(ctx)
+	if err != nil {
+		return err
+	}
+	stats.activeStreams.Add(1)
+	defer stats.activeStreams.Add(-1)
+	for {
+		if err := limiter.Wait(ctx); err != nil {
+			return err
+		}
+		if err := stream.Send(&pdpb.TsoRequest{
+			Header:     &pdpb.RequestHeader{ClusterId: clusterID},
+			Count:      1,
+			DcLocation: *dcLocation,
+		}); err != nil {
+			return err
+		}
+		resp, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		stats.successCount.Add(int64(resp.GetCount()))
 	}
 }
 

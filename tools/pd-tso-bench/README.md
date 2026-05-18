@@ -32,6 +32,16 @@ This section describes how to benchmark the GetTS performance.
   interval to output the statistics (default 1s)
 -key string
   path of file that contains X509 key in PEM format
+-direct-stream-mode
+  use long-lived raw PD.Tso streams instead of pd.Client.GetLocalTS
+-logical-tso-qps int
+  aggregate logical TSO qps target in direct stream mode
+-tidb-client-instances int
+  TiDB client instance count in direct stream mode (default 1)
+-tso-streams-per-client int
+  TSO streams per TiDB client in direct stream mode (default 1)
+-max-total-tso-streams int
+  maximum total TSO streams in direct stream mode
 -pd string
   pd address (default "127.0.0.1:2379")
 -v output statistics info every interval and output metrics info at the end
@@ -42,6 +52,20 @@ Benchmark the GetTS performance:
 ```shell
     ./pd-tso-bench -v -duration 5s
 ```
+
+Simulate production-like TSO stream fanout:
+
+```shell
+./bin/pd-tso-bench \
+  --pd=http://127.0.0.1:2379 \
+  --direct-stream-mode \
+  --logical-tso-qps=44000 \
+  --tidb-client-instances=32 \
+  --tso-streams-per-client=5 \
+  --max-total-tso-streams=160
+```
+
+Direct stream mode prints interval `count:` lines so the aggregate logical TSO QPS can be calculated as `count / interval`. Normal benchmark shutdown does not count canceled streams as reconnects or errors.
 
 It will print some benchmark results like:
 
