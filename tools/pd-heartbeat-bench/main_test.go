@@ -148,6 +148,42 @@ func TestRegionsInitFallsBackToLegacyPlaceholdersWhenKnobsZero(t *testing.T) {
 	}
 }
 
+// v2.1 (2026-05-20): regression test for the update() preservation path. Hot regions
+// not selected into updateFlow this round must keep their seeded flow values across
+// subsequent rounds. Without the preservation logic, PD HotPeerCache would see
+// alternating hot/cold and never escalate them into long-lived entries.
+func TestRegionsUpdatePreservesHotFlowAcrossRounds(t *testing.T) {
+	cfg := &config.Config{
+		StoreCount:             4,
+		RegionCount:             100,
+		Replica:                 3,
+		HotRegionRatio:          1.0, // every region is hot so we don't rely on a specific shuffle
+		HotWriteBytesPerRegion:  1_000_000,
+		HotReadBytesPerRegion:   2_000_000,
+		HotWriteKeysPerRegion:   5_000,
+		HotReadKeysPerRegion:    10_000,
+		ReportRatio:             1.0,
+		FlowUpdateRatio:         0.05, // only 5% of regions go through updateFlow each round
+	}
+
+	rs := new(Regions)
+	rs.init(cfg)
+	options := config.NewOptions(cfg)
+
+	// First update: 5% in updateFlow get jittered hot values; the other 95% should keep
+	// their seeded hot values rather than being reset to 0 by the reportRegions reset.
+	rs.update(cfg, options)
+
+	awakenAny := rs.awakenRegions.Load().([]*pdpb.RegionHeartbeatRequest)
+	zeros := 0
+	for _, r := range awakenAny {
+		if r.BytesWritten == 0 && r.BytesRead == 0 && r.KeysWritten == 0 && r.KeysRead == 0 {
+			zeros++
+		}
+	}
+	require.Zero(t, zeros, "hot regions outside updateFlow must keep their seeded flow, got %d reset to zero", zeros)
+}
+
 // v2.1 (2026-05-20): regression test for (e) — HotRegionRatio picks roughly the right
 // fraction of regions and seeds their initial flow fields from the Hot*PerRegion knobs.
 func TestRegionsInitMarksHotRegionsByRatioAndSeedsFlow(t *testing.T) {

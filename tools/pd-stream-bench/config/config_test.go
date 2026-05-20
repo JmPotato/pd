@@ -53,3 +53,62 @@ func TestConfigRejectsNegativeStreams(t *testing.T) {
 
 	require.Error(t, cfg.Validate())
 }
+
+// v2.1 (2026-05-20): single-endpoint toml stays at length-1 Endpoints; backward compat.
+func TestConfigSingleEndpointPopulatesEndpointsLen1(t *testing.T) {
+	cfg := NewConfig()
+	require.NoError(t, cfg.Parse([]string{"--pd", "https://pd0:2379"}))
+
+	require.Equal(t, "https://pd0:2379", cfg.PDAddr)
+	require.Equal(t, []string{"https://pd0:2379"}, cfg.Endpoints)
+	require.Equal(t, "https://pd0:2379", cfg.EndpointFor(0))
+	require.Equal(t, "https://pd0:2379", cfg.EndpointFor(7), "single-endpoint round-robin always returns the same addr")
+}
+
+// v2.1 (2026-05-20): comma-separated `pd =` in toml splits into Endpoints; PDAddr is
+// canonicalized to the first. Round-robin via EndpointFor distributes the workerIDs.
+func TestConfigMultiEndpointFromTomlSplitsAndRoundRobins(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stream.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+pd = "https://pd0:2379,https://pd1:2379,https://pd2:2379"
+metastorage-watch-streams = 6
+`), 0o600))
+
+	cfg := NewConfig()
+	require.NoError(t, cfg.Parse([]string{"--config", path}))
+
+	require.Equal(t, "https://pd0:2379", cfg.PDAddr, "PDAddr canonicalizes to first endpoint")
+	require.Equal(t, []string{
+		"https://pd0:2379",
+		"https://pd1:2379",
+		"https://pd2:2379",
+	}, cfg.Endpoints)
+
+	// workerID round-robin
+	require.Equal(t, "https://pd0:2379", cfg.EndpointFor(0))
+	require.Equal(t, "https://pd1:2379", cfg.EndpointFor(1))
+	require.Equal(t, "https://pd2:2379", cfg.EndpointFor(2))
+	require.Equal(t, "https://pd0:2379", cfg.EndpointFor(3))
+	require.Equal(t, "https://pd0:2379", cfg.EndpointFor(-3), "negative ID is mirrored to keep distribution stable")
+}
+
+// v2.1 (2026-05-20): whitespace and trailing comma in `pd =` are tolerated. Empty parts
+// are dropped so an accidental trailing comma doesn't leave an empty endpoint behind.
+func TestConfigMultiEndpointTrimsAndDropsEmpty(t *testing.T) {
+	cfg := NewConfig()
+	require.NoError(t, cfg.Parse([]string{"--pd", "  https://pd0:2379 , https://pd1:2379 , "}))
+
+	require.Equal(t, []string{
+		"https://pd0:2379",
+		"https://pd1:2379",
+	}, cfg.Endpoints)
+}
+
+// v2.1 (2026-05-20): an empty PDAddr is rejected by Validate so misconfigured topologies
+// surface early instead of dying at first dial.
+func TestConfigRejectsEmptyPDAddr(t *testing.T) {
+	cfg := NewConfig()
+
+	require.Error(t, cfg.Parse([]string{"--pd", ""}))
+}

@@ -63,7 +63,7 @@ func main() {
 	}
 	defer closeIdleConnections(idleConns)
 	log.Info("pd-stream-bench started",
-		zap.String("pd", cfg.PDAddr),
+		zap.Strings("endpoints", cfg.Endpoints),
 		zap.Int("metastorage-watch-streams", cfg.MetaStorageWatchStreams),
 		zap.Int("acquire-token-buckets-streams", cfg.AcquireTokenBucketsStreams),
 		zap.Int("etcd-watch-streams", cfg.EtcdWatchStreams),

@@ -27,6 +27,10 @@ type Config struct {
 	flagSet    *flag.FlagSet
 	configFile string
 
+	// PDAddr is the toml `pd` field. It accepts either a single endpoint or a
+	// comma-separated list (e.g. "https://A:2379,https://B:2379,https://C:2379"). After
+	// Adjust() runs, PDAddr is canonicalized to the FIRST endpoint, and Endpoints holds
+	// the full normalized list. Use EndpointFor(workerID) to round-robin across them.
 	PDAddr     string `toml:"pd" json:"pd"`
 	StatusAddr string `toml:"status-addr" json:"status-addr"`
 	CAPath     string `toml:"cacert" json:"cacert"`
@@ -34,12 +38,31 @@ type Config struct {
 	KeyPath    string `toml:"key" json:"key"`
 	CheckOnly  bool   `toml:"check-only" json:"check-only"`
 
+	// Endpoints is the parsed multi-endpoint list. Not toml-exposed (derived from PDAddr
+	// in Adjust). Always non-empty after a successful Parse(). v2.1 (2026-05-20): added to
+	// let workers distribute long-lived gRPC streams across all 3 PD instances; without
+	// this every stream lands on PD0 and the leader's goroutine count blows past the 5.8k
+	// target (5/18 run saw 7,317 at the precheck snapshot).
+	Endpoints []string `toml:"-" json:"endpoints"`
+
 	MetaStorageWatchStreams    int `toml:"metastorage-watch-streams" json:"metastorage-watch-streams"`
 	AcquireTokenBucketsStreams int `toml:"acquire-token-buckets-streams" json:"acquire-token-buckets-streams"`
 	EtcdWatchStreams           int `toml:"etcd-watch-streams" json:"etcd-watch-streams"`
 	LeaseKeepaliveStreams      int `toml:"lease-keepalive-streams" json:"lease-keepalive-streams"`
 	ConnectionFanoutTarget     int `toml:"connection-fanout-target" json:"connection-fanout-target"`
 	StreamRequestIntervalMS    int `toml:"stream-request-interval-ms" json:"stream-request-interval-ms"`
+}
+
+// EndpointFor returns the PD endpoint assigned to workerID via round-robin across the
+// configured Endpoints list. Always returns a non-empty endpoint after Adjust() runs.
+func (c *Config) EndpointFor(workerID int) string {
+	if len(c.Endpoints) == 0 {
+		return c.PDAddr
+	}
+	if workerID < 0 {
+		workerID = -workerID
+	}
+	return c.Endpoints[workerID%len(c.Endpoints)]
 }
 
 // NewConfig returns a config with flags registered.
@@ -83,9 +106,21 @@ func (c *Config) Parse(arguments []string) error {
 	return c.Validate()
 }
 
-// Adjust fills defaults.
+// Adjust fills defaults and splits PDAddr's CSV form into Endpoints.
 func (c *Config) Adjust() {
-	c.PDAddr = normalizePDAddr(c.PDAddr)
+	c.Endpoints = c.Endpoints[:0]
+	for _, part := range strings.Split(c.PDAddr, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		c.Endpoints = append(c.Endpoints, normalizePDAddr(part))
+	}
+	if len(c.Endpoints) > 0 {
+		c.PDAddr = c.Endpoints[0]
+	} else {
+		c.PDAddr = normalizePDAddr(c.PDAddr)
+	}
 	if c.StreamRequestIntervalMS == 0 {
 		c.StreamRequestIntervalMS = 1000
 	}
@@ -93,6 +128,9 @@ func (c *Config) Adjust() {
 
 // Validate validates stream counts.
 func (c *Config) Validate() error {
+	if len(c.Endpoints) == 0 {
+		return errors.Errorf("pd endpoint list is empty (set --pd or toml `pd = \"https://host:port[,...]\"`)")
+	}
 	if c.MetaStorageWatchStreams < 0 {
 		return errors.Errorf("metastorage-watch-streams can not be negative")
 	}

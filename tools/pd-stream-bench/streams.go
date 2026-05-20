@@ -185,21 +185,26 @@ func loadTLSConfig(cfg *config.Config) (*tls.Config, error) {
 	}.ToTLSConfig()
 }
 
-func newGRPCConn(ctx context.Context, cfg *config.Config) (*grpc.ClientConn, error) {
+// newGRPCConn dials a single PD endpoint. v2.1 (2026-05-20): the endpoint is now an
+// explicit argument so workers can pin to a specific PD instance (round-robin via
+// cfg.EndpointFor). Passing cfg.PDAddr (= first endpoint) preserves single-endpoint
+// callers like checkCapability that don't care about distribution.
+func newGRPCConn(ctx context.Context, cfg *config.Config, addr string) (*grpc.ClientConn, error) {
 	tlsCfg, err := loadTLSConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return grpcutil.GetClientConn(ctx, cfg.PDAddr, tlsCfg)
+	return grpcutil.GetClientConn(ctx, addr, tlsCfg)
 }
 
-func newEtcdClient(cfg *config.Config) (*clientv3.Client, error) {
+// newEtcdClient dials a single PD's etcd endpoint. v2.1 (2026-05-20): see newGRPCConn.
+func newEtcdClient(cfg *config.Config, addr string) (*clientv3.Client, error) {
 	tlsCfg, err := loadTLSConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
 	return clientv3.New(clientv3.Config{
-		Endpoints:   []string{cfg.PDAddr},
+		Endpoints:   []string{addr},
 		DialTimeout: 3 * time.Second,
 		TLS:         tlsCfg,
 	})
@@ -244,8 +249,8 @@ func runReconnectingWorker(ctx context.Context, name string, counters *statusCou
 	}
 }
 
-func runMetaStorageWatch(ctx context.Context, cfg *config.Config, counters *statusCounters, workerID int) error {
-	conn, err := newGRPCConn(ctx, cfg)
+func runMetaStorageWatch(ctx context.Context, cfg *config.Config, counters *statusCounters, workerID int, addr string) error {
+	conn, err := newGRPCConn(ctx, cfg, addr)
 	if err != nil {
 		return err
 	}
@@ -266,8 +271,8 @@ func runMetaStorageWatch(ctx context.Context, cfg *config.Config, counters *stat
 	}
 }
 
-func runAcquireTokenBuckets(ctx context.Context, cfg *config.Config, counters *statusCounters, workerID int) error {
-	conn, err := newGRPCConn(ctx, cfg)
+func runAcquireTokenBuckets(ctx context.Context, cfg *config.Config, counters *statusCounters, workerID int, addr string) error {
+	conn, err := newGRPCConn(ctx, cfg, addr)
 	if err != nil {
 		return err
 	}
@@ -303,8 +308,8 @@ func runAcquireTokenBuckets(ctx context.Context, cfg *config.Config, counters *s
 	}
 }
 
-func runEtcdWatch(ctx context.Context, cfg *config.Config, counters *statusCounters, workerID int) error {
-	cli, err := newEtcdClient(cfg)
+func runEtcdWatch(ctx context.Context, cfg *config.Config, counters *statusCounters, workerID int, addr string) error {
+	cli, err := newEtcdClient(cfg, addr)
 	if err != nil {
 		return err
 	}
@@ -327,8 +332,8 @@ func runEtcdWatch(ctx context.Context, cfg *config.Config, counters *statusCount
 	}
 }
 
-func runLeaseKeepalive(ctx context.Context, cfg *config.Config, counters *statusCounters, workerID int) error {
-	cli, err := newEtcdClient(cfg)
+func runLeaseKeepalive(ctx context.Context, cfg *config.Config, counters *statusCounters, workerID int, addr string) error {
+	cli, err := newEtcdClient(cfg, addr)
 	if err != nil {
 		return err
 	}
@@ -355,10 +360,14 @@ func runLeaseKeepalive(ctx context.Context, cfg *config.Config, counters *status
 	}
 }
 
+// openIdleConnections opens `count` idle gRPC connections. v2.1 (2026-05-20): connections
+// are round-robined across cfg.Endpoints so the fanout target (1000 conn) is split evenly
+// across PD instances, not piled onto PD0.
 func openIdleConnections(ctx context.Context, cfg *config.Config, counters *statusCounters, count int) ([]*grpc.ClientConn, error) {
 	conns := make([]*grpc.ClientConn, 0, count)
-	for range count {
-		conn, err := newGRPCConn(ctx, cfg)
+	for i := range count {
+		addr := cfg.EndpointFor(i)
+		conn, err := newGRPCConn(ctx, cfg, addr)
 		if err != nil {
 			for _, conn := range conns {
 				_ = conn.Close()
@@ -377,67 +386,73 @@ func closeIdleConnections(conns []*grpc.ClientConn) {
 	}
 }
 
+// checkCapability validates each configured stream type against EVERY endpoint
+// (v2.1 (2026-05-20)). Previously it only checked the first endpoint, which would mask
+// a misconfigured follower until the stream worker tried to dial it for the first time
+// and failed mid-window.
 func checkCapability(ctx context.Context, cfg *config.Config) error {
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if cfg.MetaStorageWatchStreams > 0 {
-		conn, err := newGRPCConn(checkCtx, cfg)
-		if err != nil {
-			return errors.Annotatef(err, "MetaStorage.Watch endpoint %s", cfg.PDAddr)
+	for _, addr := range cfg.Endpoints {
+		if cfg.MetaStorageWatchStreams > 0 {
+			conn, err := newGRPCConn(checkCtx, cfg, addr)
+			if err != nil {
+				return errors.Annotatef(err, "MetaStorage.Watch endpoint %s", addr)
+			}
+			stream, err := meta_storagepb.NewMetaStorageClient(conn).Watch(checkCtx, &meta_storagepb.WatchRequest{
+				Header: &meta_storagepb.RequestHeader{Source: "pd-stream-bench-check"},
+				Key:    []byte("/pd-stress/metastorage-watch/check"),
+			})
+			if err == nil {
+				err = recvMetaStorageCheck(checkCtx, stream)
+			}
+			_ = conn.Close()
+			if err != nil {
+				return errors.Annotatef(err, "MetaStorage.Watch endpoint %s", addr)
+			}
 		}
-		stream, err := meta_storagepb.NewMetaStorageClient(conn).Watch(checkCtx, &meta_storagepb.WatchRequest{
-			Header: &meta_storagepb.RequestHeader{Source: "pd-stream-bench-check"},
-			Key:    []byte("/pd-stress/metastorage-watch/check"),
-		})
-		if err == nil {
-			err = recvMetaStorageCheck(checkCtx, stream)
+		if cfg.AcquireTokenBucketsStreams > 0 {
+			conn, err := newGRPCConn(checkCtx, cfg, addr)
+			if err != nil {
+				return errors.Annotatef(err, "ResourceManager.AcquireTokenBuckets endpoint %s", addr)
+			}
+			stream, err := rmpb.NewResourceManagerClient(conn).AcquireTokenBuckets(checkCtx)
+			if err == nil {
+				err = stream.Send(buildResourceManagerTokenRequest(0, cfg.StreamRequestIntervalMS))
+			}
+			if err == nil {
+				err = recvAcquireTokenBucketsCheck(checkCtx, stream)
+			}
+			_ = conn.Close()
+			if err != nil {
+				return errors.Annotatef(err, "ResourceManager.AcquireTokenBuckets endpoint %s", addr)
+			}
 		}
-		_ = conn.Close()
-		if err != nil {
-			return errors.Annotatef(err, "MetaStorage.Watch endpoint %s", cfg.PDAddr)
+		if cfg.EtcdWatchStreams > 0 {
+			if err := checkEtcdWatchCapability(checkCtx, cfg, addr); err != nil {
+				return errors.Annotatef(err, "etcd watch endpoint %s", addr)
+			}
 		}
-	}
-	if cfg.AcquireTokenBucketsStreams > 0 {
-		conn, err := newGRPCConn(checkCtx, cfg)
-		if err != nil {
-			return errors.Annotatef(err, "ResourceManager.AcquireTokenBuckets endpoint %s", cfg.PDAddr)
-		}
-		stream, err := rmpb.NewResourceManagerClient(conn).AcquireTokenBuckets(checkCtx)
-		if err == nil {
-			err = stream.Send(buildResourceManagerTokenRequest(0, cfg.StreamRequestIntervalMS))
-		}
-		if err == nil {
-			err = recvAcquireTokenBucketsCheck(checkCtx, stream)
-		}
-		_ = conn.Close()
-		if err != nil {
-			return errors.Annotatef(err, "ResourceManager.AcquireTokenBuckets endpoint %s", cfg.PDAddr)
-		}
-	}
-	if cfg.EtcdWatchStreams > 0 {
-		if err := checkEtcdWatchCapability(checkCtx, cfg); err != nil {
-			return errors.Annotatef(err, "etcd watch endpoint %s", cfg.PDAddr)
-		}
-	}
-	if cfg.LeaseKeepaliveStreams > 0 {
-		cli, err := newEtcdClient(cfg)
-		if err != nil {
-			return errors.Annotatef(err, "lease keepalive endpoint %s", cfg.PDAddr)
-		}
-		lease, err := cli.Grant(checkCtx, 60)
-		if err == nil {
-			_, err = cli.KeepAlive(checkCtx, lease.ID)
-		}
-		_ = cli.Close()
-		if err != nil {
-			return errors.Annotatef(err, "lease keepalive endpoint %s", cfg.PDAddr)
+		if cfg.LeaseKeepaliveStreams > 0 {
+			cli, err := newEtcdClient(cfg, addr)
+			if err != nil {
+				return errors.Annotatef(err, "lease keepalive endpoint %s", addr)
+			}
+			lease, err := cli.Grant(checkCtx, 60)
+			if err == nil {
+				_, err = cli.KeepAlive(checkCtx, lease.ID)
+			}
+			_ = cli.Close()
+			if err != nil {
+				return errors.Annotatef(err, "lease keepalive endpoint %s", addr)
+			}
 		}
 	}
 	return nil
 }
 
-func checkEtcdWatchCapability(ctx context.Context, cfg *config.Config) error {
-	cli, err := newEtcdClient(cfg)
+func checkEtcdWatchCapability(ctx context.Context, cfg *config.Config, addr string) error {
+	cli, err := newEtcdClient(cfg, addr)
 	if err != nil {
 		return err
 	}
@@ -525,29 +540,37 @@ func isExpectedCheckTimeout(err error) bool {
 	return code == codes.DeadlineExceeded || code == codes.Canceled
 }
 
+// startWorkers spawns each configured stream worker, round-robining its target endpoint
+// across cfg.Endpoints. v2.1 (2026-05-20): the endpoint distribution is what spreads gRPC
+// stream handler goroutines across all 3 PD instances so leader's goroutine count stays
+// in the 5.3-5.8k target band instead of overshooting to 7k+.
 func startWorkers(ctx context.Context, cfg *config.Config, counters *statusCounters) {
 	for i := 0; i < cfg.MetaStorageWatchStreams; i++ {
 		workerID := i
+		addr := cfg.EndpointFor(workerID)
 		go runReconnectingWorker(ctx, streamMetaStorageWatch, counters, func(ctx context.Context) error {
-			return runMetaStorageWatch(ctx, cfg, counters, workerID)
+			return runMetaStorageWatch(ctx, cfg, counters, workerID, addr)
 		})
 	}
 	for i := 0; i < cfg.AcquireTokenBucketsStreams; i++ {
 		workerID := i
+		addr := cfg.EndpointFor(workerID)
 		go runReconnectingWorker(ctx, streamAcquireTokenBuckets, counters, func(ctx context.Context) error {
-			return runAcquireTokenBuckets(ctx, cfg, counters, workerID)
+			return runAcquireTokenBuckets(ctx, cfg, counters, workerID, addr)
 		})
 	}
 	for i := 0; i < cfg.EtcdWatchStreams; i++ {
 		workerID := i
+		addr := cfg.EndpointFor(workerID)
 		go runReconnectingWorker(ctx, streamEtcdWatch, counters, func(ctx context.Context) error {
-			return runEtcdWatch(ctx, cfg, counters, workerID)
+			return runEtcdWatch(ctx, cfg, counters, workerID, addr)
 		})
 	}
 	for i := 0; i < cfg.LeaseKeepaliveStreams; i++ {
 		workerID := i
+		addr := cfg.EndpointFor(workerID)
 		go runReconnectingWorker(ctx, streamLeaseKeepalive, counters, func(ctx context.Context) error {
-			return runLeaseKeepalive(ctx, cfg, counters, workerID)
+			return runLeaseKeepalive(ctx, cfg, counters, workerID, addr)
 		})
 	}
 }
