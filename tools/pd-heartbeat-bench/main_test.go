@@ -18,6 +18,7 @@ import (
 	"context"
 	stderrors "errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +26,8 @@ import (
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/pd/tools/pd-heartbeat-bench/config"
+	"go.etcd.io/etcd/pkg/v3/report"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestRegionsInitAddsLearnerPeers(t *testing.T) {
@@ -303,4 +306,193 @@ func (c *blockingReportBucketsClient) Send(*pdpb.ReportBucketsRequest) error {
 func (c *blockingReportBucketsClient) CloseAndRecv() (*pdpb.ReportBucketsResponse, error) {
 	<-c.ctx.Done()
 	return nil, io.EOF
+}
+
+// v2.3 (2026-05-20): tests for smooth heartbeat pacing.
+
+// timingHeartbeatStream is a minimal pdpb.PD_RegionHeartbeatClient that records the
+// wall-clock instant of each Send call so the test can verify the pacing distribution.
+type timingHeartbeatStream struct {
+	mu        sync.Mutex
+	sendTimes []time.Time
+	ctx       context.Context
+}
+
+func (s *timingHeartbeatStream) Send(*pdpb.RegionHeartbeatRequest) error {
+	s.mu.Lock()
+	s.sendTimes = append(s.sendTimes, time.Now())
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *timingHeartbeatStream) Recv() (*pdpb.RegionHeartbeatResponse, error) {
+	return nil, io.EOF
+}
+
+func (s *timingHeartbeatStream) Header() (metadata.MD, error) { return metadata.MD{}, nil }
+func (s *timingHeartbeatStream) Trailer() metadata.MD         { return metadata.MD{} }
+func (s *timingHeartbeatStream) CloseSend() error             { return nil }
+func (s *timingHeartbeatStream) Context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+func (s *timingHeartbeatStream) SendMsg(any) error { return nil }
+func (s *timingHeartbeatStream) RecvMsg(any) error { return nil }
+
+func (s *timingHeartbeatStream) snapshot() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]time.Time, len(s.sendTimes))
+	copy(out, s.sendTimes)
+	return out
+}
+
+func TestComputeSmoothPaceDelay(t *testing.T) {
+	cfgOff := &config.Config{SmoothHeartbeatPacing: false}
+	cfgOn := &config.Config{SmoothHeartbeatPacing: true}
+
+	require.Equal(t, time.Duration(0), computeSmoothPaceDelay(cfgOff, time.Second, 100), "smooth disabled = 0")
+	require.Equal(t, time.Duration(0), computeSmoothPaceDelay(cfgOn, 0, 100), "paceInterval=0 = 0")
+	require.Equal(t, time.Duration(0), computeSmoothPaceDelay(cfgOn, time.Second, 0), "regions=0 = 0")
+	require.Equal(t, time.Duration(0), computeSmoothPaceDelay(cfgOn, time.Second, 1_000_000_000), "delay < 1µs = 0 (don't pace at sub-µs)")
+	require.Equal(t, 10*time.Millisecond, computeSmoothPaceDelay(cfgOn, time.Second, 100), "1s/100 = 10ms")
+	// Online-typical: 60s outer tick, 81.6k regions per store => 735µs per region.
+	got := computeSmoothPaceDelay(cfgOn, 60*time.Second, 81600)
+	require.InDelta(t, 735*time.Microsecond, got, float64(time.Microsecond), "60s/81600 ≈ 735µs ±1µs")
+}
+
+func TestPaceJitterIsWithinTenPercent(t *testing.T) {
+	const d = 100 * time.Millisecond
+	for range 200 {
+		got := paceJitter(d)
+		require.GreaterOrEqual(t, got, d-d/10, "jitter > -10%%")
+		require.LessOrEqual(t, got, d+d/10, "jitter < +10%%")
+	}
+	require.Equal(t, time.Duration(0), paceJitter(0), "zero in zero out")
+}
+
+func TestHandleRegionHeartbeatSmoothPacesAcrossInterval(t *testing.T) {
+	// 5 regions across a 100 ms paceInterval => per-region delay = 20 ms
+	// total expected wall-clock = 4 inter-send sleeps × 20 ms = 80 ms (last send no sleep)
+	// allow ±50% slack for jitter + scheduler noise.
+	cfg := &config.Config{
+		StoreCount:            2,
+		RegionCount:           5,
+		Replica:               1,
+		SmoothHeartbeatPacing: true,
+	}
+	rs := new(Regions)
+	rs.init(cfg)
+	// Force every region's leader onto store 1 so handleRegionHeartbeat picks them all up.
+	for _, r := range rs.regions {
+		if len(r.Region.Peers) == 0 {
+			continue
+		}
+		r.Leader = r.Region.Peers[0]
+		r.Leader.StoreId = 1
+	}
+	stream := &timingHeartbeatStream{}
+	rep := report.NewReport("%4.4f")
+	done := rep.Stats()
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	start := time.Now()
+	go rs.handleRegionHeartbeat(context.Background(), cfg, wg, stream, 1, rep, 100*time.Millisecond)
+	wg.Wait()
+	close(rep.Results())
+	<-done
+	elapsed := time.Since(start)
+
+	sends := stream.snapshot()
+	require.Len(t, sends, 5, "all regions sent")
+	require.GreaterOrEqual(t, elapsed, 50*time.Millisecond, "smooth pacing produces measurable wait (>= 50ms for 4 × 20ms gaps)")
+	require.LessOrEqual(t, elapsed, 250*time.Millisecond, "should not balloon past ~2× expected even with jitter")
+
+	// Inter-send gaps should be close to 20 ms each (with ±10%% jitter).
+	for i := 1; i < len(sends); i++ {
+		gap := sends[i].Sub(sends[i-1])
+		require.GreaterOrEqual(t, gap, 15*time.Millisecond, "gap >= ~min jitter")
+		require.LessOrEqual(t, gap, 60*time.Millisecond, "gap <= 60ms (jitter + scheduler slop)")
+	}
+}
+
+func TestHandleRegionHeartbeatBurstyWhenSmoothDisabled(t *testing.T) {
+	// Same setup as the smooth test, but SmoothHeartbeatPacing=false: all sends should
+	// complete in milliseconds (no pacing).
+	cfg := &config.Config{
+		StoreCount:            2,
+		RegionCount:           5,
+		Replica:               1,
+		SmoothHeartbeatPacing: false, // legacy bursty
+	}
+	rs := new(Regions)
+	rs.init(cfg)
+	for _, r := range rs.regions {
+		if len(r.Region.Peers) == 0 {
+			continue
+		}
+		r.Leader = r.Region.Peers[0]
+		r.Leader.StoreId = 1
+	}
+	stream := &timingHeartbeatStream{}
+	rep := report.NewReport("%4.4f")
+	done := rep.Stats()
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	start := time.Now()
+	// paceInterval is passed but should be ignored when smooth=false
+	go rs.handleRegionHeartbeat(context.Background(), cfg, wg, stream, 1, rep, 100*time.Millisecond)
+	wg.Wait()
+	close(rep.Results())
+	<-done
+	elapsed := time.Since(start)
+
+	sends := stream.snapshot()
+	require.Len(t, sends, 5)
+	require.LessOrEqual(t, elapsed, 30*time.Millisecond, "legacy bursty mode must NOT pace; all 5 sends in a few ms")
+}
+
+func TestHandleRegionHeartbeatRespectsContextCancel(t *testing.T) {
+	// Smooth pacing must exit promptly when ctx is cancelled.
+	cfg := &config.Config{
+		StoreCount:            2,
+		RegionCount:           1000,
+		Replica:               1,
+		SmoothHeartbeatPacing: true,
+	}
+	rs := new(Regions)
+	rs.init(cfg)
+	for _, r := range rs.regions {
+		if len(r.Region.Peers) == 0 {
+			continue
+		}
+		r.Leader = r.Region.Peers[0]
+		r.Leader.StoreId = 1
+	}
+	stream := &timingHeartbeatStream{}
+	rep := report.NewReport("%4.4f")
+	done := rep.Stats()
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// paceInterval = 10s across 1000 regions => 10ms per region, so a full natural run
+	// would be 10s. Cancelling after 50ms should exit within ~100ms total.
+	go rs.handleRegionHeartbeat(ctx, cfg, wg, stream, 1, rep, 10*time.Second)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	waitCh := make(chan struct{})
+	go func() { wg.Wait(); close(waitCh) }()
+	select {
+	case <-waitCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("handleRegionHeartbeat did not exit within 500ms of ctx cancel")
+	}
+	close(rep.Results())
+	<-done
+
+	sends := stream.snapshot()
+	require.Less(t, len(sends), 50, "should have sent only a handful before cancel; got %d", len(sends))
 }

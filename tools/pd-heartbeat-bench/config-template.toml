@@ -52,3 +52,14 @@ store-capacity-gib = 0
 # made PD drop ~6,100 buckets in the 5/18 run with `store of the bucket in region is not
 # found`. Leave true unless explicitly studying the race.
 buckets-after-first-heartbeat-round = true
+
+# v2.3 (2026-05-20) smooth pacing. When true, each per-store worker spreads its region
+# heartbeat sends uniformly across the outer-tick window (per-region delay =
+# outer_tick / regions_for_store, with ±10% jitter so 100 stores don't sync-burst).
+# Per-region cadence stays unchanged (still 60s = regionReportInterval) — only the
+# arrival distribution at PD changes from "59s idle + 1s burst" to "steady ~136k/s".
+# Set true to match online TiKV's uniform delivery and to stay in workflow §20.6's
+# reproduction envelope (leader CPU 8-15 cores, mark phase 3-5s).
+# Do NOT also raise region-heartbeat-qps "to smooth more" — that changes the
+# per-region cadence away from online (5/20 v2 misstep).
+smooth-heartbeat-pacing = false

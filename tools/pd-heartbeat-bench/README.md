@@ -71,6 +71,38 @@ buckets-after-first-heartbeat-round = true
 CLI flags mirror the toml field names verbatim (e.g.
 `--region-approximate-size-mib 96`).
 
+## v2.3 Smooth Heartbeat Pacing (2026-05-20)
+
+`smooth-heartbeat-pacing` (default `false`) controls whether each per-store worker
+spreads its region heartbeats uniformly across the outer-tick window or bursts them
+on the tick:
+
+```toml
+# legacy bursty (default): every outer tick (60s by default), each of the 100 stores
+# pushes ALL its regions in a tight loop within milliseconds. Net effect at PD: 59s
+# idle + 1s of 8.16M-hb burst. Easy to operate but not what TiKV does.
+smooth-heartbeat-pacing = false
+
+# v2.3 smooth pacing: each store spreads its 81.6k sends across the 60s window with
+# ±10% jitter per inter-send sleep so 100 stores don't synchronize-burst. Per-region
+# delay = outer_tick_interval / regions_for_this_store ≈ 60s / 81600 = 735µs.
+# PD sees steady ~136k hbs/s rather than burst pattern. Matches online TiKV.
+smooth-heartbeat-pacing = true
+```
+
+**Important**: smooth pacing does NOT change the per-region cadence — every region
+still heartbeats every `regionReportInterval` (60s). It changes the temporal
+distribution of arrivals at PD within each 60s window. This is structurally
+different from raising `region-heartbeat-qps` (which changes the per-region
+cadence itself and was the 2026-05-20 v2 misstep that crushed online-realistic
+GC frequency).
+
+Use case: the big-pd-pressure stress test's reproduction envelope (workflow
+§20.5 / §20.6) requires leader CPU 8-15 cores AND mark phase 3-5s, both of
+which are hard to hit with bursty mode because the burst transiently spikes CPU
+to ~47 cores. v2.3 smooth pacing is the recommended way to reach the envelope
+without going through the "raise qps" anti-pattern.
+
 Build:
 
 ```shell

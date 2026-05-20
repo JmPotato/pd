@@ -42,6 +42,15 @@ const (
 	defaultStoreCapacityGiB             = 0 // 0 -> compute from RegionCount * Replica * Size
 	defaultBucketsAfterFirstHeartbeat   = true
 
+	// v2.3 (2026-05-20): default is bursty (false) to preserve v2.2 behaviour as
+	// observed in pd-stress-20260520-141301. Operators who want to reproduce online's
+	// uniform 136k hbs/s arrival pattern instead of bench's 60s-idle + 1s-burst should
+	// flip to true and re-run the envelope check (workflow §20.6). NOT the same as
+	// raising region-heartbeat-qps — that changes per-region cadence; this keeps
+	// per-region cadence == regionReportInterval and only spreads SENDS within the
+	// outer-tick window.
+	defaultSmoothHeartbeatPacing = false
+
 	defaultLogFormat = "text"
 )
 
@@ -115,6 +124,22 @@ type Config struct {
 	// `the store of the bucket in region is not found` and drops the bucket; 5/18 saw 6,100
 	// dropped). Set false to reproduce the legacy racing behaviour.
 	BucketsAfterFirstHeartbeatRound bool `toml:"buckets-after-first-heartbeat-round" json:"buckets-after-first-heartbeat-round"`
+
+	// SmoothHeartbeatPacing: when true, each per-store worker spreads its region heartbeat
+	// sends uniformly across the outer-ticker interval (with ±10 % jitter so 100 stores
+	// don't synchronize-burst). When false (default), each worker sends all its regions in
+	// a tight loop on each outer tick — the legacy bench behaviour that produces a ~1 s
+	// burst every 60 s, very different from online TiKV's uniform delivery (~136 k hbs/s
+	// steady).
+	//
+	// This is the v2.3 reproduction-envelope knob: bursty mode has 59 s of idle followed
+	// by a CPU/alloc-rate spike; online has continuous moderate alloc rate. Switch to true
+	// when investigating whether smooth alloc rate matters for lfstack contention
+	// reproduction. NOTE: do NOT also raise `region-heartbeat-qps` to "make it smoother" —
+	// that changes the per-region cadence to non-online values (5/20 v2 mistake). Keep
+	// `region-heartbeat-qps = 0` so the outer ticker stays at 60 s and only pacing
+	// distribution changes.
+	SmoothHeartbeatPacing bool `toml:"smooth-heartbeat-pacing" json:"smooth-heartbeat-pacing"`
 }
 
 // NewConfig return a set of settings.
@@ -148,6 +173,7 @@ func NewConfig() *Config {
 	fs.Uint64Var(&cfg.HotReadKeysPerRegion, "hot-read-keys-per-region", 0, "KeysRead per heartbeat interval for hot regions")
 	fs.IntVar(&cfg.StoreCapacityGiB, "store-capacity-gib", 0, "per-store capacity in GiB; 0 auto-computes from region count")
 	fs.BoolVar(&cfg.BucketsAfterFirstHeartbeatRound, "buckets-after-first-heartbeat-round", defaultBucketsAfterFirstHeartbeat, "gate ReportBuckets workers on first heartbeat round complete (fixes race)")
+	fs.BoolVar(&cfg.SmoothHeartbeatPacing, "smooth-heartbeat-pacing", defaultSmoothHeartbeatPacing, "spread per-store region heartbeats uniformly across the outer-tick window with ±10%% jitter (v2.3 experimental); false = legacy bursty")
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", "127.0.0.1:9090", "the address to pull metrics")
 
 	return cfg
@@ -244,6 +270,9 @@ func (c *Config) Adjust(meta *toml.MetaData) {
 	}
 	if !isDefined(meta, "buckets-after-first-heartbeat-round") {
 		c.BucketsAfterFirstHeartbeatRound = defaultBucketsAfterFirstHeartbeat
+	}
+	if !isDefined(meta, "smooth-heartbeat-pacing") {
+		c.SmoothHeartbeatPacing = defaultSmoothHeartbeatPacing
 	}
 }
 

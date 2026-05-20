@@ -160,6 +160,20 @@ func TestConfigV21KnobDefaults(t *testing.T) {
 	require.Equal(t, uint64(0), cfg.HotWriteBytesPerRegion)
 	require.Equal(t, 0, cfg.StoreCapacityGiB)
 	require.True(t, cfg.BucketsAfterFirstHeartbeatRound, "default must gate bucket workers")
+	// v2.3 default: smooth pacing OFF (preserves v2.2 bursty behaviour).
+	require.False(t, cfg.SmoothHeartbeatPacing, "default must keep legacy bursty mode")
+}
+
+// v2.3 (2026-05-20): smooth-heartbeat-pacing toml knob round-trips.
+func TestConfigParsesV23SmoothHeartbeatPacing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "heartbeat.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`smooth-heartbeat-pacing = true
+`), 0o600))
+
+	cfg := NewConfig()
+	require.NoError(t, cfg.Parse([]string{"--config", path}))
+	require.True(t, cfg.SmoothHeartbeatPacing)
 }
 
 func TestConfigRejectsHotRegionRatioOutOfRange(t *testing.T) {

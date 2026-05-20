@@ -498,7 +498,47 @@ func createHeartbeatStream(ctx context.Context, cfg *config.Config) (pdpb.PDClie
 	return cli, stream
 }
 
-func (rs *Regions) handleRegionHeartbeat(wg *sync.WaitGroup, stream pdpb.PD_RegionHeartbeatClient, storeID uint64, rep report.Report) {
+// computeSmoothPaceDelay returns the per-region sleep used in smooth pacing mode.
+// Zero means no pacing (bursty / legacy). Extracted so unit tests can validate the
+// math without spinning up a fake gRPC stream.
+//
+// v2.3 (2026-05-20): pace target is the outer-tick interval (which IS the per-region
+// cadence in this bench design), divided by the number of regions this worker will
+// send. Result: 60s / 81600 = 735µs per send when cfg defaults * 100 stores * 8.16M.
+// 0 returns trigger:
+//   - smooth pacing disabled in config
+//   - paceInterval <= 0 (degenerate / passed by misuse)
+//   - regions == 0 (worker has nothing to do)
+//   - delay would round to < 1µs (no point pacing at that resolution; just burst)
+func computeSmoothPaceDelay(cfg *config.Config, paceInterval time.Duration, regions int) time.Duration {
+	if !cfg.SmoothHeartbeatPacing {
+		return 0
+	}
+	if paceInterval <= 0 || regions <= 0 {
+		return 0
+	}
+	d := paceInterval / time.Duration(regions)
+	if d < time.Microsecond {
+		return 0
+	}
+	return d
+}
+
+// paceJitter returns a per-iteration sleep with ±10% jitter around perRegionDelay,
+// to prevent 100 stores synchronizing their inter-send sleeps and burst-firing
+// together. Returns 0 if delay is 0 (caller skips sleep entirely).
+func paceJitter(perRegionDelay time.Duration) time.Duration {
+	if perRegionDelay <= 0 {
+		return 0
+	}
+	// jitterRange = ±10% of perRegionDelay, expressed as [0, perRegionDelay/5] then
+	// shifted by -perRegionDelay/10 to center on zero.
+	maxJitterPlus := int64(perRegionDelay/5) + 1
+	j := rand.Int63n(maxJitterPlus) - int64(perRegionDelay/10)
+	return perRegionDelay + time.Duration(j)
+}
+
+func (rs *Regions) handleRegionHeartbeat(ctx context.Context, cfg *config.Config, wg *sync.WaitGroup, stream pdpb.PD_RegionHeartbeatClient, storeID uint64, rep report.Report, paceInterval time.Duration) {
 	defer wg.Done()
 	var regions, toUpdate []*pdpb.RegionHeartbeatRequest
 	updatedRegions := rs.awakenRegions.Load()
@@ -514,9 +554,13 @@ func (rs *Regions) handleRegionHeartbeat(wg *sync.WaitGroup, stream pdpb.PD_Regi
 		regions = append(regions, region)
 	}
 
+	// v2.3 (2026-05-20): per-region pacing. Zero delay = bursty (legacy) mode.
+	perRegionDelay := computeSmoothPaceDelay(cfg, paceInterval, len(regions))
+
 	start := time.Now()
 	var err error
-	for _, region := range regions {
+	lastIdx := len(regions) - 1
+	for i, region := range regions {
 		err = stream.Send(region)
 		rep.Results() <- report.Result{Start: start, End: time.Now(), Err: err}
 		if err == io.EOF {
@@ -531,8 +575,16 @@ func (rs *Regions) handleRegionHeartbeat(wg *sync.WaitGroup, stream pdpb.PD_Regi
 			log.Error("send result error", zap.Uint64("store-id", storeID), zap.Error(err))
 			return
 		}
+		// Pace remaining sends; no point sleeping after the last one.
+		if perRegionDelay > 0 && i < lastIdx {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(paceJitter(perRegionDelay)):
+			}
+		}
 	}
-	log.Info("store finish one round region heartbeat", zap.Uint64("store-id", storeID), zap.Duration("cost-time", time.Since(start)), zap.Int("reported-region-count", len(regions)))
+	log.Info("store finish one round region heartbeat", zap.Uint64("store-id", storeID), zap.Duration("cost-time", time.Since(start)), zap.Int("reported-region-count", len(regions)), zap.Duration("per-region-delay", perRegionDelay))
 }
 
 // Stores contains store stats with lock.
@@ -915,8 +967,15 @@ func main() {
 	header := &pdpb.RequestHeader{
 		ClusterId: clusterID,
 	}
-	heartbeatTicker := time.NewTicker(intervalForAggregateQPS(cfg.RegionHeartbeatQPS, cfg.RegionCount, regionReportInterval*time.Second))
+	heartbeatTickInterval := intervalForAggregateQPS(cfg.RegionHeartbeatQPS, cfg.RegionCount, regionReportInterval*time.Second)
+	heartbeatTicker := time.NewTicker(heartbeatTickInterval)
 	defer heartbeatTicker.Stop()
+	if cfg.SmoothHeartbeatPacing {
+		log.Info("smooth heartbeat pacing enabled",
+			zap.Duration("outer-tick-interval", heartbeatTickInterval),
+			zap.Int("region-count", cfg.RegionCount),
+			zap.Int("store-count", cfg.StoreCount))
+	}
 	runMinResolvedTSReporter(ctx, cfg.StoreCount, intervalForAggregateQPS(cfg.ReportMinResolvedTSQPS, cfg.StoreCount, time.Second), func(ctx context.Context, id uint64) error {
 		cli := clis[id]
 		_, err := cli.ReportMinResolvedTS(ctx, &pdpb.ReportMinResolvedTsRequest{
@@ -959,7 +1018,7 @@ func main() {
 			for i := 1; i <= cfg.StoreCount; i++ {
 				id := uint64(i)
 				wg.Add(1)
-				go regions.handleRegionHeartbeat(wg, streams[id], id, rep)
+				go regions.handleRegionHeartbeat(ctx, cfg, wg, streams[id], id, rep, heartbeatTickInterval)
 			}
 			if withMetric {
 				metrics.CollectMetrics(regions.updateRound, time.Second)
