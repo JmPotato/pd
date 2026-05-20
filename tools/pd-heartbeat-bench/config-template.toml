@@ -21,3 +21,34 @@ flow-update-ratio = 0.0
 no-update-ratio = 0.0
 
 sample = false
+
+# v2.1 (2026-05-20) content-fidelity knobs. Required to push PD leader live heap into the
+# line-cluster 25-40 GB range and trigger lease keepalive starvation warn. See design doc
+# §2.4 + workflow doc §19 (project big-pd-pressure) for the diagnostic chain.
+
+# Initial region content. TiKV defaults are 96 MiB / ~1M keys; matching those makes PD's
+# RegionInfo carry realistic bytes per region. Leaving these at 0 (or omitting) keeps the
+# legacy 128B / 8keys placeholder behaviour and PD heap will not reach the line target.
+region-approximate-size-mib = 96
+region-approximate-keys = 1000000
+
+# Hot region marking. HotRegionRatio = 0.05 means 5% of regions are flagged hot at init;
+# when those regions are in the updateFlow set, the heartbeat uses the per-region traffic
+# values below. Drives PD HotPeerCache / LabelStatistics long-lived heap. Composable with
+# the legacy hot-store-count mechanism (set both to test either path independently).
+hot-region-ratio = 0.05
+hot-write-bytes-per-region = 16000000
+hot-read-bytes-per-region = 2000000
+hot-write-keys-per-region = 50000
+hot-read-keys-per-region = 10000
+
+# Per-store capacity. 0 = auto-compute as 2 * RegionCount * Replica * region size /
+# StoreCount, with the legacy 4 TiB as floor. Must scale with region-approximate-size-mib
+# so store.Available doesn't underflow on the heartbeat reduction path.
+store-capacity-gib = 0
+
+# Bucket-vs-heartbeat race fix. true (default) makes ReportBuckets workers wait for the
+# first heartbeat round to finish before sending; false reproduces the legacy race that
+# made PD drop ~6,100 buckets in the 5/18 run with `store of the bucket in region is not
+# found`. Leave true unless explicitly studying the race.
+buckets-after-first-heartbeat-round = true

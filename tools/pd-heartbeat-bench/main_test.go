@@ -107,8 +107,110 @@ func TestReportBucketsWorkersRespectConfiguredStreamCount(t *testing.T) {
 	startReportBucketsWorkers(ctx, 3, time.Hour, rs, status, func(context.Context) (reportBucketsClient, error) {
 		created.Add(1)
 		return &blockingReportBucketsClient{ctx: ctx}, nil
-	})
+	}, nil)
 
+	require.Eventually(t, func() bool {
+		return created.Load() == 3 && status.activeStreams.Load() == 3
+	}, time.Second, 10*time.Millisecond)
+}
+
+// v2.1 (2026-05-20): regression test for (d) — explicit RegionApproximateSizeMiB and
+// RegionApproximateKeys propagate to the synthetic heartbeat. Without this, PD's
+// RegionInfo stays bytesUnit/keysUnit-sized and never produces the line-cluster heap.
+func TestRegionsInitAppliesContentFidelityKnobs(t *testing.T) {
+	cfg := &config.Config{
+		StoreCount:               4,
+		RegionCount:              3,
+		Replica:                  3,
+		RegionApproximateSizeMiB: 96,
+		RegionApproximateKeys:    1_000_000,
+	}
+
+	rs := new(Regions)
+	rs.init(cfg)
+
+	for _, region := range rs.regions {
+		require.Equal(t, uint64(96)*uint64(1<<20), region.ApproximateSize)
+		require.Equal(t, uint64(1_000_000), region.ApproximateKeys)
+	}
+}
+
+// v2.1 (2026-05-20): regression test for the legacy default — when knobs are zero, the
+// existing 128B / 8keys placeholder behaviour is preserved (backwards compat).
+func TestRegionsInitFallsBackToLegacyPlaceholdersWhenKnobsZero(t *testing.T) {
+	cfg := &config.Config{StoreCount: 4, RegionCount: 2, Replica: 3}
+	rs := new(Regions)
+	rs.init(cfg)
+
+	for _, region := range rs.regions {
+		require.Equal(t, uint64(128), region.ApproximateSize)
+		require.Equal(t, uint64(8), region.ApproximateKeys)
+	}
+}
+
+// v2.1 (2026-05-20): regression test for (e) — HotRegionRatio picks roughly the right
+// fraction of regions and seeds their initial flow fields from the Hot*PerRegion knobs.
+func TestRegionsInitMarksHotRegionsByRatioAndSeedsFlow(t *testing.T) {
+	cfg := &config.Config{
+		StoreCount:             4,
+		RegionCount:             100,
+		Replica:                 3,
+		HotRegionRatio:          0.30,
+		HotWriteBytesPerRegion:  1_000_000,
+		HotReadBytesPerRegion:   2_000_000,
+		HotWriteKeysPerRegion:   5_000,
+		HotReadKeysPerRegion:    10_000,
+	}
+
+	rs := new(Regions)
+	rs.init(cfg)
+
+	require.Equal(t, 30, countHotRegions(rs), "expected 30 hot regions for ratio 0.3 of 100")
+
+	hot, cold := 0, 0
+	for i, region := range rs.regions {
+		if rs.hotRegion[i] {
+			hot++
+			require.Equal(t, uint64(1_000_000), region.BytesWritten, "hot region BytesWritten should be seeded")
+			require.Equal(t, uint64(2_000_000), region.BytesRead, "hot region BytesRead should be seeded")
+			require.Equal(t, uint64(5_000), region.KeysWritten)
+			require.Equal(t, uint64(10_000), region.KeysRead)
+		} else {
+			cold++
+			require.Equal(t, uint64(0), region.BytesWritten, "cold region should not be seeded")
+			require.Equal(t, uint64(0), region.BytesRead)
+		}
+	}
+	require.Equal(t, 30, hot)
+	require.Equal(t, 70, cold)
+}
+
+// v2.1 (2026-05-20): regression test for (f) — when a gate channel is supplied, workers
+// must not call the factory until the gate is closed (= first heartbeat round done).
+// Without this, ReportBuckets races RegionHeartbeat and PD drops the bucket.
+func TestReportBucketsWorkersBlockUntilGateClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := &config.Config{StoreCount: 4, RegionCount: 10, Replica: 3}
+	rs := new(Regions)
+	rs.init(cfg)
+	status := newBucketReporterStatus()
+	var created atomic.Int64
+
+	gate := make(chan struct{})
+	startReportBucketsWorkers(ctx, 3, time.Hour, rs, status, func(context.Context) (reportBucketsClient, error) {
+		created.Add(1)
+		return &blockingReportBucketsClient{ctx: ctx}, nil
+	}, gate)
+
+	// Give the goroutines a chance to run. They should be blocked on the gate, so no
+	// stream factory call yet.
+	require.Never(t, func() bool {
+		return created.Load() > 0
+	}, 100*time.Millisecond, 20*time.Millisecond, "no stream should be created while gate is closed")
+
+	// Release the gate: workers should now open their streams.
+	close(gate)
 	require.Eventually(t, func() bool {
 		return created.Load() == 3 && status.activeStreams.Load() == 3
 	}, time.Second, 10*time.Millisecond)

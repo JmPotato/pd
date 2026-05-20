@@ -27,6 +27,21 @@ const (
 	defaultSample            = false
 	defaultInitialVersion    = 1
 
+	// v2.1 (2026-05-20) content fidelity defaults. Zero means "skip" -> use the legacy
+	// 128B / 8keys placeholder behaviour. Non-zero values let synthetic heartbeats populate
+	// PD's RegionInfo / RegionStatistics / HotPeerCache long-lived caches, which is required
+	// to push leader live heap to the line-cluster 25-40 GB range that triggers lfstack
+	// contention and the lease keepalive starvation warn we want to reproduce.
+	defaultRegionApproximateSizeMiB     = 0
+	defaultRegionApproximateKeys        = 0
+	defaultHotRegionRatio               = 0.0
+	defaultHotWriteBytesPerRegion       = 0
+	defaultHotReadBytesPerRegion        = 0
+	defaultHotWriteKeysPerRegion        = 0
+	defaultHotReadKeysPerRegion         = 0
+	defaultStoreCapacityGiB             = 0 // 0 -> compute from RegionCount * Replica * Size
+	defaultBucketsAfterFirstHeartbeat   = true
+
 	defaultLogFormat = "text"
 )
 
@@ -66,6 +81,40 @@ type Config struct {
 	ReportMinResolvedTSQPS  int `toml:"report-min-resolved-ts-qps" json:"report-min-resolved-ts-qps"`
 	ReportBucketsStreams    int `toml:"report-buckets-streams" json:"report-buckets-streams"`
 	ReportBucketsIntervalMS int `toml:"report-buckets-interval-ms" json:"report-buckets-interval-ms"`
+
+	// v2.1 (2026-05-20) content fidelity knobs — see big-pd-pressure design doc §2.4 for
+	// why these are required to reproduce the line cluster lease keepalive starvation.
+
+	// RegionApproximateSizeMiB / RegionApproximateKeys: initial values written into every
+	// synthetic region's heartbeat so PD's RegionInfo carries realistic size/keys. Zero =
+	// keep the legacy 128B / 8keys placeholders. Recommended: 96 MiB / 1_000_000 to match
+	// TiKV default region.
+	RegionApproximateSizeMiB int `toml:"region-approximate-size-mib" json:"region-approximate-size-mib"`
+	RegionApproximateKeys    int `toml:"region-approximate-keys" json:"region-approximate-keys"`
+
+	// HotRegionRatio: fraction in [0,1] of regions marked as hot at init() time. Independent
+	// of HotStoreCount (which keys hot detection off the leader's store id). When >0 and the
+	// region is in updateFlow, the heartbeat uses the HotWrite*/HotRead* values below
+	// (interpreted as per-interval bytes/keys, scaled across the regionReportInterval). Drives
+	// PD HotPeerCache / LabelStatistics long-lived heap.
+	HotRegionRatio         float64 `toml:"hot-region-ratio" json:"hot-region-ratio"`
+	HotWriteBytesPerRegion uint64  `toml:"hot-write-bytes-per-region" json:"hot-write-bytes-per-region"`
+	HotReadBytesPerRegion  uint64  `toml:"hot-read-bytes-per-region" json:"hot-read-bytes-per-region"`
+	HotWriteKeysPerRegion  uint64  `toml:"hot-write-keys-per-region" json:"hot-write-keys-per-region"`
+	HotReadKeysPerRegion   uint64  `toml:"hot-read-keys-per-region" json:"hot-read-keys-per-region"`
+
+	// StoreCapacityGiB: per-store capacity to report. Zero means auto-compute as
+	// 2 * RegionCount * Replica * RegionApproximateSize / StoreCount so we never wrap on
+	// `store.Available -= region.ApproximateSize`. Must be set explicitly when
+	// RegionApproximateSizeMiB pushes total simulated cluster size past the legacy 4 TiB cap.
+	StoreCapacityGiB int `toml:"store-capacity-gib" json:"store-capacity-gib"`
+
+	// BucketsAfterFirstHeartbeatRound: when true (default), ReportBuckets workers wait for
+	// the first full RegionHeartbeat round to complete before sending their first bucket
+	// report. Fixes the race where buckets arrive at PD before regions are known (PD logs
+	// `the store of the bucket in region is not found` and drops the bucket; 5/18 saw 6,100
+	// dropped). Set false to reproduce the legacy racing behaviour.
+	BucketsAfterFirstHeartbeatRound bool `toml:"buckets-after-first-heartbeat-round" json:"buckets-after-first-heartbeat-round"`
 }
 
 // NewConfig return a set of settings.
@@ -90,6 +139,15 @@ func NewConfig() *Config {
 	fs.IntVar(&cfg.ReportMinResolvedTSQPS, "report-min-resolved-ts-qps", 0, "aggregate ReportMinResolvedTS qps target")
 	fs.IntVar(&cfg.ReportBucketsStreams, "report-buckets-streams", 0, "active ReportBuckets stream count")
 	fs.IntVar(&cfg.ReportBucketsIntervalMS, "report-buckets-interval-ms", 1000, "per-stream ReportBuckets send interval in milliseconds")
+	fs.IntVar(&cfg.RegionApproximateSizeMiB, "region-approximate-size-mib", 0, "synthetic region approximate size in MiB; 0 keeps legacy 128B placeholder")
+	fs.IntVar(&cfg.RegionApproximateKeys, "region-approximate-keys", 0, "synthetic region approximate keys; 0 keeps legacy 8-keys placeholder")
+	fs.Float64Var(&cfg.HotRegionRatio, "hot-region-ratio", 0, "fraction in [0,1] of regions marked hot at init")
+	fs.Uint64Var(&cfg.HotWriteBytesPerRegion, "hot-write-bytes-per-region", 0, "BytesWritten per heartbeat interval for hot regions")
+	fs.Uint64Var(&cfg.HotReadBytesPerRegion, "hot-read-bytes-per-region", 0, "BytesRead per heartbeat interval for hot regions")
+	fs.Uint64Var(&cfg.HotWriteKeysPerRegion, "hot-write-keys-per-region", 0, "KeysWritten per heartbeat interval for hot regions")
+	fs.Uint64Var(&cfg.HotReadKeysPerRegion, "hot-read-keys-per-region", 0, "KeysRead per heartbeat interval for hot regions")
+	fs.IntVar(&cfg.StoreCapacityGiB, "store-capacity-gib", 0, "per-store capacity in GiB; 0 auto-computes from region count")
+	fs.BoolVar(&cfg.BucketsAfterFirstHeartbeatRound, "buckets-after-first-heartbeat-round", defaultBucketsAfterFirstHeartbeat, "gate ReportBuckets workers on first heartbeat round complete (fixes race)")
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", "127.0.0.1:9090", "the address to pull metrics")
 
 	return cfg
@@ -170,6 +228,22 @@ func (c *Config) Adjust(meta *toml.MetaData) {
 	}
 	if !isDefined(meta, "epoch-ver") {
 		c.InitEpochVer = defaultInitialVersion
+	}
+
+	if !isDefined(meta, "region-approximate-size-mib") {
+		configutil.AdjustInt(&c.RegionApproximateSizeMiB, defaultRegionApproximateSizeMiB)
+	}
+	if !isDefined(meta, "region-approximate-keys") {
+		configutil.AdjustInt(&c.RegionApproximateKeys, defaultRegionApproximateKeys)
+	}
+	if !isDefined(meta, "hot-region-ratio") {
+		configutil.AdjustFloat64(&c.HotRegionRatio, defaultHotRegionRatio)
+	}
+	if !isDefined(meta, "store-capacity-gib") {
+		configutil.AdjustInt(&c.StoreCapacityGiB, defaultStoreCapacityGiB)
+	}
+	if !isDefined(meta, "buckets-after-first-heartbeat-round") {
+		c.BucketsAfterFirstHeartbeatRound = defaultBucketsAfterFirstHeartbeat
 	}
 }
 
@@ -252,6 +326,18 @@ func (c *Config) Validate() error {
 	}
 	if c.ReportBucketsIntervalMS < 0 {
 		return errors.Errorf("report-buckets-interval-ms can not be negative")
+	}
+	if c.RegionApproximateSizeMiB < 0 {
+		return errors.Errorf("region-approximate-size-mib can not be negative")
+	}
+	if c.RegionApproximateKeys < 0 {
+		return errors.Errorf("region-approximate-keys can not be negative")
+	}
+	if c.HotRegionRatio < 0 || c.HotRegionRatio > 1 {
+		return errors.Errorf("hot-region-ratio must be in [0, 1]")
+	}
+	if c.StoreCapacityGiB < 0 {
+		return errors.Errorf("store-capacity-gib can not be negative")
 	}
 	return nil
 }

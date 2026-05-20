@@ -64,8 +64,32 @@ const (
 	hotQueryUnit         = 256
 	regionReportInterval = 60 // 60s
 	storeReportInterval  = 10 // 10s
-	capacity             = 4 * units.TiB
+	legacyCapacity       = 4 * units.TiB
 )
+
+// computeStoreCapacity returns the per-store capacity bytes. If cfg.StoreCapacityGiB > 0 it is
+// honoured; otherwise we auto-scale to 2x the per-store live data (RegionCount * Replica *
+// RegionApproximateSize / StoreCount), with the legacy 4 TiB as the floor so we don't regress
+// the small-cluster default. Required because lifting RegionApproximateSizeMiB to TiKV-realistic
+// values (96 MiB) makes 8.16M regions overflow the legacy cap and underflow store.Available.
+func computeStoreCapacity(cfg *config.Config) uint64 {
+	if cfg.StoreCapacityGiB > 0 {
+		return uint64(cfg.StoreCapacityGiB) * uint64(units.GiB)
+	}
+	if cfg.StoreCount <= 0 || cfg.RegionCount <= 0 || cfg.Replica <= 0 {
+		return legacyCapacity
+	}
+	sizePerRegion := uint64(cfg.RegionApproximateSizeMiB) * uint64(units.MiB)
+	if sizePerRegion == 0 {
+		sizePerRegion = bytesUnit
+	}
+	perStoreLive := uint64(cfg.RegionCount) * uint64(cfg.Replica) * sizePerRegion / uint64(cfg.StoreCount)
+	auto := 2 * perStoreLive
+	if auto < legacyCapacity {
+		return legacyCapacity
+	}
+	return auto
+}
 
 var (
 	clusterID  uint64
@@ -236,11 +260,48 @@ type Regions struct {
 	updateEpoch  []int
 	updateSpace  []int
 	updateFlow   []int
+
+	// v2.1 (2026-05-20): hotRegion[i] = true marks region i as a hot region. When the region
+	// is in updateFlow, the update() path uses cfg.HotWrite*/HotRead* values to populate
+	// BytesWritten/Read/KeysWritten/Read, driving PD HotPeerCache / LabelStatistics
+	// long-lived heap. Set at init() based on cfg.HotRegionRatio. Independent of (and
+	// composable with) the legacy HotStoreCount mechanism.
+	hotRegion []bool
 }
 
 func (rs *Regions) init(cfg *config.Config) {
 	rs.regions = make([]*pdpb.RegionHeartbeatRequest, 0, cfg.RegionCount)
 	rs.updateRound = 0
+
+	// v2.1 (2026-05-20): initial ApproximateSize/Keys come from config when set (>0),
+	// otherwise we keep the legacy 128B / 8keys placeholders for backwards compat.
+	initialSize := uint64(bytesUnit)
+	initialKeys := uint64(keysUint)
+	if cfg.RegionApproximateSizeMiB > 0 {
+		initialSize = uint64(cfg.RegionApproximateSizeMiB) * uint64(units.MiB)
+	}
+	if cfg.RegionApproximateKeys > 0 {
+		initialKeys = uint64(cfg.RegionApproximateKeys)
+	}
+
+	// v2.1 (2026-05-20): precompute hot-region marker bitmap so update() can apply the
+	// configured hot-flow values without re-rolling each round. Deterministic given seed.
+	rs.hotRegion = make([]bool, cfg.RegionCount)
+	if cfg.HotRegionRatio > 0 {
+		hotCount := int(float64(cfg.RegionCount) * cfg.HotRegionRatio)
+		// Pick the first hotCount of a shuffled index set. Using a local rng so we don't
+		// disturb the global random sequence used by update().
+		indexes := make([]int, cfg.RegionCount)
+		for i := range indexes {
+			indexes[i] = i
+		}
+		rand.Shuffle(cfg.RegionCount, func(i, j int) {
+			indexes[i], indexes[j] = indexes[j], indexes[i]
+		})
+		for _, idx := range indexes[:hotCount] {
+			rs.hotRegion[idx] = true
+		}
+	}
 
 	// Generate regions
 	id := uint64(1)
@@ -255,13 +316,13 @@ func (rs *Regions) init(cfg *config.Config) {
 				EndKey:      codec.GenerateTableKey(int64(i + 1)),
 				RegionEpoch: &metapb.RegionEpoch{ConfVer: 2, Version: maxVersion},
 			},
-			ApproximateSize: bytesUnit,
+			ApproximateSize: initialSize,
 			Interval: &pdpb.TimeInterval{
 				StartTimestamp: now,
 				EndTimestamp:   now + regionReportInterval,
 			},
 			QueryStats:      &pdpb.QueryStats{},
-			ApproximateKeys: keysUint,
+			ApproximateKeys: initialKeys,
 			Term:            1,
 		}
 		id += 1
@@ -289,6 +350,14 @@ func (rs *Regions) init(cfg *config.Config) {
 
 		region.Region.Peers = peers
 		region.Leader = peers[0]
+		// v2.1 (2026-05-20): seed hot-region flow at init so PD's HotPeerCache sees a hot
+		// signal on the very first heartbeat round even before update() applies a flow tick.
+		if rs.hotRegion[i] {
+			region.BytesWritten = cfg.HotWriteBytesPerRegion
+			region.BytesRead = cfg.HotReadBytesPerRegion
+			region.KeysWritten = cfg.HotWriteKeysPerRegion
+			region.KeysRead = cfg.HotReadKeysPerRegion
+		}
 		rs.regions = append(rs.regions, region)
 	}
 }
@@ -333,9 +402,33 @@ func (rs *Regions) update(cfg *config.Config, options *config.Options) {
 		region.ApproximateKeys = uint64(keysUint * rand.Float64())
 	}
 	// update flow
+	// v2.1 (2026-05-20): a region is "hot" if (a) its leader sits in a hot store (legacy
+	// HotStoreCount path) OR (b) it was marked hot at init time via HotRegionRatio. The two
+	// mechanisms compose — operators can opt into either or both.
+	hotStoreCount := uint64(options.GetHotStoreCount())
 	for _, i := range rs.updateFlow {
 		region := rs.regions[i]
-		if region.Leader.StoreId <= uint64(options.GetHotStoreCount()) {
+		hotByStore := hotStoreCount > 0 && region.Leader.StoreId <= hotStoreCount
+		hotByRegion := i < len(rs.hotRegion) && rs.hotRegion[i]
+		switch {
+		case hotByRegion && (cfg.HotWriteBytesPerRegion|cfg.HotReadBytesPerRegion|cfg.HotWriteKeysPerRegion|cfg.HotReadKeysPerRegion) != 0:
+			// Use the per-region knobs verbatim (jittered ±20% so PD's stat path sees
+			// non-constant input and doesn't dedupe). These represent per-interval traffic.
+			jitter := func(v uint64) uint64 {
+				if v == 0 {
+					return 0
+				}
+				return uint64(float64(v) * (0.8 + 0.4*rand.Float64()))
+			}
+			region.BytesWritten = jitter(cfg.HotWriteBytesPerRegion)
+			region.BytesRead = jitter(cfg.HotReadBytesPerRegion)
+			region.KeysWritten = jitter(cfg.HotWriteKeysPerRegion)
+			region.KeysRead = jitter(cfg.HotReadKeysPerRegion)
+			region.QueryStats = &pdpb.QueryStats{
+				Get: uint64(hotQueryUnit * (1 + rand.Float64()) * 10),
+				Put: uint64(hotQueryUnit * (1 + rand.Float64()) * 60),
+			}
+		case hotByStore:
 			region.BytesWritten = uint64(hotByteUnit * (1 + rand.Float64()) * 60)
 			region.BytesRead = uint64(hotByteUnit * (1 + rand.Float64()) * 10)
 			region.KeysWritten = uint64(hotKeysUint * (1 + rand.Float64()) * 60)
@@ -344,7 +437,7 @@ func (rs *Regions) update(cfg *config.Config, options *config.Options) {
 				Get: uint64(hotQueryUnit * (1 + rand.Float64()) * 10),
 				Put: uint64(hotQueryUnit * (1 + rand.Float64()) * 60),
 			}
-		} else {
+		default:
 			region.BytesWritten = uint64(bytesUnit * rand.Float64())
 			region.BytesRead = uint64(bytesUnit * rand.Float64())
 			region.KeysWritten = uint64(keysUint * rand.Float64())
@@ -361,15 +454,24 @@ func (rs *Regions) update(cfg *config.Config, options *config.Options) {
 		region.Interval.StartTimestamp = region.Interval.EndTimestamp
 		region.Interval.EndTimestamp = region.Interval.StartTimestamp + regionReportInterval
 	}
+	// v2.1 (2026-05-20): hot regions get their flow signal preserved across rounds even
+	// when not selected into updateFlow this round. Without this, PD's HotPeerCache would
+	// observe a hot region as alternating hot/cold and never escalate it into a long-lived
+	// hot peer entry — defeating the purpose of HotRegionRatio.
+	hotKnobsSet := (cfg.HotWriteBytesPerRegion | cfg.HotReadBytesPerRegion | cfg.HotWriteKeysPerRegion | cfg.HotReadKeysPerRegion) != 0
 	for _, i := range reportRegions {
 		region := rs.regions[i]
 		// reset the statistics of the region which is not updated
 		if _, exist := updatedStatisticsMap[i]; !exist {
-			region.BytesWritten = 0
-			region.BytesRead = 0
-			region.KeysWritten = 0
-			region.KeysRead = 0
-			region.QueryStats = &pdpb.QueryStats{}
+			if i < len(rs.hotRegion) && rs.hotRegion[i] && hotKnobsSet {
+				// keep the seeded hot flow signal
+			} else {
+				region.BytesWritten = 0
+				region.BytesRead = 0
+				region.KeysWritten = 0
+				region.KeysRead = 0
+				region.QueryStats = &pdpb.QueryStats{}
+			}
 		}
 		awakenRegions = append(awakenRegions, region)
 	}
@@ -435,12 +537,27 @@ func (rs *Regions) handleRegionHeartbeat(wg *sync.WaitGroup, stream pdpb.PD_Regi
 
 // Stores contains store stats with lock.
 type Stores struct {
-	stat []atomic.Value
+	stat     []atomic.Value
+	capacity uint64 // v2.1 (2026-05-20): configurable per-store capacity
 }
 
 func newStores(storeCount int) *Stores {
 	return &Stores{
-		stat: make([]atomic.Value, storeCount+1),
+		stat:     make([]atomic.Value, storeCount+1),
+		capacity: legacyCapacity,
+	}
+}
+
+// v2.1 (2026-05-20): factory that respects the configured (or auto-computed) per-store
+// capacity so `store.Available -= region.ApproximateSize` doesn't underflow when
+// RegionApproximateSizeMiB pushes per-store live data past the legacy 4 TiB cap.
+func newStoresWithCapacity(storeCount int, capacityBytes uint64) *Stores {
+	if capacityBytes == 0 {
+		capacityBytes = legacyCapacity
+	}
+	return &Stores{
+		stat:     make([]atomic.Value, storeCount+1),
+		capacity: capacityBytes,
 	}
 }
 
@@ -453,11 +570,15 @@ func (s *Stores) heartbeat(ctx context.Context, cli pdpb.PDClient, storeID uint6
 func (s *Stores) update(rs *Regions) {
 	stats := make([]*pdpb.StoreStats, len(s.stat))
 	now := uint64(time.Now().Unix())
+	cap := s.capacity
+	if cap == 0 {
+		cap = legacyCapacity
+	}
 	for i := range stats {
 		stats[i] = &pdpb.StoreStats{
 			StoreId:    uint64(i),
-			Capacity:   capacity,
-			Available:  capacity,
+			Capacity:   cap,
+			Available:  cap,
 			QueryStats: &pdpb.QueryStats{},
 			PeerStats:  make([]*pdpb.PeerStat, 0),
 			Interval: &pdpb.TimeInterval{
@@ -501,6 +622,18 @@ func (s *Stores) update(rs *Regions) {
 	for i := range stats {
 		s.stat[i].Store(stats[i])
 	}
+}
+
+// countHotRegions reports the number of regions flagged hot at init() time. Useful for the
+// startup log so operators can confirm HotRegionRatio took effect.
+func countHotRegions(rs *Regions) int {
+	n := 0
+	for _, h := range rs.hotRegion {
+		if h {
+			n++
+		}
+	}
+	return n
 }
 
 func randomPick(slice []int, total int, ratio float64) []int {
@@ -593,6 +726,7 @@ func startReportBucketsWorkers(
 	regions *Regions,
 	status *bucketReporterStatus,
 	factory reportBucketsStreamFactory,
+	gate <-chan struct{},
 ) {
 	if streamCount <= 0 {
 		return
@@ -602,7 +736,7 @@ func startReportBucketsWorkers(
 	}
 	for i := 0; i < streamCount; i++ {
 		workerID := i
-		go runReportBucketsWorker(ctx, workerID, interval, regions, status, factory)
+		go runReportBucketsWorker(ctx, workerID, interval, regions, status, factory, gate)
 	}
 }
 
@@ -613,7 +747,20 @@ func runReportBucketsWorker(
 	regions *Regions,
 	status *bucketReporterStatus,
 	factory reportBucketsStreamFactory,
+	gate <-chan struct{},
 ) {
+	// v2.1 (2026-05-20): wait for the gate (typically the first RegionHeartbeat round to
+	// finish) before opening the bucket stream. Otherwise the bucket arrives at PD before
+	// PD knows the region and gets dropped with `the store of the bucket in region is not
+	// found` (5/18 run logged 6,100 such drops in the first round). nil gate = legacy
+	// behaviour (start immediately) for backwards compat.
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -745,8 +892,15 @@ func main() {
 	go runHTTPServer(cfg, options)
 	regions := new(Regions)
 	regions.init(cfg)
-	log.Info("finish init regions")
-	stores := newStores(cfg.StoreCount)
+	log.Info("finish init regions",
+		zap.Int("region-count", cfg.RegionCount),
+		zap.Int("hot-region-count", countHotRegions(regions)),
+		zap.Int("region-size-mib", cfg.RegionApproximateSizeMiB),
+		zap.Int("region-keys", cfg.RegionApproximateKeys),
+	)
+	storeCap := computeStoreCapacity(cfg)
+	log.Info("store capacity", zap.Uint64("per-store-bytes", storeCap), zap.Uint64("per-store-gib", storeCap/uint64(units.GiB)))
+	stores := newStoresWithCapacity(cfg.StoreCount, storeCap)
 	stores.update(regions)
 	bootstrap(ctx, cli)
 	putStores(ctx, cfg, cli, stores)
@@ -773,6 +927,13 @@ func main() {
 		return err
 	})
 	bucketStatus := newBucketReporterStatus()
+	// v2.1 (2026-05-20): when configured, gate bucket workers on first heartbeat round to
+	// avoid the bucket-arrives-before-region race documented in (f). gate=nil disables the
+	// gate (legacy racing behaviour).
+	var bucketGate chan struct{}
+	if cfg.BucketsAfterFirstHeartbeatRound {
+		bucketGate = make(chan struct{})
+	}
 	startReportBucketsWorkers(
 		ctx,
 		cfg.ReportBucketsStreams,
@@ -780,8 +941,10 @@ func main() {
 		regions,
 		bucketStatus,
 		newReportBucketsStreamFactory(cli),
+		bucketGate,
 	)
 	withMetric := metrics.InitMetric2Collect(cfg.MetricsAddr)
+	firstRoundDone := false
 	for {
 		select {
 		case <-heartbeatTicker.C:
@@ -802,6 +965,16 @@ func main() {
 				metrics.CollectMetrics(regions.updateRound, time.Second)
 			}
 			wg.Wait()
+
+			// v2.1 (2026-05-20): release bucket workers exactly once after the first
+			// completed heartbeat round. Subsequent rounds are no-ops.
+			if !firstRoundDone {
+				firstRoundDone = true
+				if bucketGate != nil {
+					close(bucketGate)
+					log.Info("first heartbeat round complete; releasing report-buckets workers")
+				}
+			}
 
 			since := time.Since(startTime).Seconds()
 			close(rep.Results())

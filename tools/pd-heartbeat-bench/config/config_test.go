@@ -116,3 +116,79 @@ report-buckets-interval-ms = 5000
 	require.Equal(t, 100, cfg.ReportBucketsStreams)
 	require.Equal(t, 5000, cfg.ReportBucketsIntervalMS)
 }
+
+// v2.1 (2026-05-20): the new content-fidelity / hot-region / bucket-gate knobs round-trip
+// through toml.
+func TestConfigParsesV21ContentFidelityKnobs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "heartbeat.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+region-approximate-size-mib = 96
+region-approximate-keys = 1000000
+hot-region-ratio = 0.05
+hot-write-bytes-per-region = 16000000
+hot-read-bytes-per-region = 2000000
+hot-write-keys-per-region = 50000
+hot-read-keys-per-region = 10000
+store-capacity-gib = 32768
+buckets-after-first-heartbeat-round = false
+`), 0o600))
+
+	cfg := NewConfig()
+	require.NoError(t, cfg.Parse([]string{"--config", path}))
+
+	require.Equal(t, 96, cfg.RegionApproximateSizeMiB)
+	require.Equal(t, 1000000, cfg.RegionApproximateKeys)
+	require.InDelta(t, 0.05, cfg.HotRegionRatio, 1e-9)
+	require.Equal(t, uint64(16000000), cfg.HotWriteBytesPerRegion)
+	require.Equal(t, uint64(2000000), cfg.HotReadBytesPerRegion)
+	require.Equal(t, uint64(50000), cfg.HotWriteKeysPerRegion)
+	require.Equal(t, uint64(10000), cfg.HotReadKeysPerRegion)
+	require.Equal(t, 32768, cfg.StoreCapacityGiB)
+	require.False(t, cfg.BucketsAfterFirstHeartbeatRound)
+}
+
+// v2.1 (2026-05-20): when knobs are absent from toml, defaults preserve legacy behaviour
+// (zero content fidelity, gate ON for safety).
+func TestConfigV21KnobDefaults(t *testing.T) {
+	cfg := NewConfig()
+	require.NoError(t, cfg.Parse(nil))
+
+	require.Equal(t, 0, cfg.RegionApproximateSizeMiB)
+	require.Equal(t, 0, cfg.RegionApproximateKeys)
+	require.Equal(t, 0.0, cfg.HotRegionRatio)
+	require.Equal(t, uint64(0), cfg.HotWriteBytesPerRegion)
+	require.Equal(t, 0, cfg.StoreCapacityGiB)
+	require.True(t, cfg.BucketsAfterFirstHeartbeatRound, "default must gate bucket workers")
+}
+
+func TestConfigRejectsHotRegionRatioOutOfRange(t *testing.T) {
+	cfg := NewConfig()
+	cfg.StoreCount = 10
+	cfg.RegionCount = 100
+	cfg.Replica = 3
+	cfg.HotRegionRatio = 1.5
+
+	require.Error(t, cfg.Validate())
+}
+
+func TestConfigRejectsNegativeContentKnobs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		apply func(c *Config)
+	}{
+		{"negative size", func(c *Config) { c.RegionApproximateSizeMiB = -1 }},
+		{"negative keys", func(c *Config) { c.RegionApproximateKeys = -1 }},
+		{"negative capacity", func(c *Config) { c.StoreCapacityGiB = -1 }},
+		{"negative hot ratio", func(c *Config) { c.HotRegionRatio = -0.1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := NewConfig()
+			cfg.StoreCount = 10
+			cfg.RegionCount = 100
+			cfg.Replica = 3
+			tc.apply(cfg)
+			require.Error(t, cfg.Validate())
+		})
+	}
+}
