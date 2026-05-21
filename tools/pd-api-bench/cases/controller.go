@@ -22,6 +22,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/log"
+	"github.com/prometheus/client_golang/prometheus"
 	pd "github.com/tikv/pd/client"
 	pdHttp "github.com/tikv/pd/client/http"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -30,6 +31,32 @@ import (
 )
 
 var base = int64(time.Second) / int64(time.Microsecond)
+
+// v3.1 (2026-05-21): gRPC-case bench-side request/duration counters with a
+// "result" label so transfer-leader / not-leader transient errors are visible
+// in the bench /metrics endpoint (PD-side grpc_server_handled_total only
+// covers requests that actually reached PD, missing client-side transport
+// errors during reconnect).
+var (
+	grpcRequestCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "pd_api_bench",
+			Name:      "grpc_request_total",
+			Help:      "Bench-side gRPC request count by case and result (success|error).",
+		}, []string{"type", "result"})
+	grpcRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "pd_api_bench",
+			Name:      "grpc_request_duration_seconds",
+			Help:      "Bench-side gRPC request latency (includes any retry / reconnect inside PD client lib).",
+			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 20),
+		}, []string{"type"})
+)
+
+func init() {
+	prometheus.MustRegister(grpcRequestCount)
+	prometheus.MustRegister(grpcRequestDuration)
+}
 
 // Coordinator managers the operation of the gRPC and HTTP case.
 type Coordinator struct {
@@ -305,12 +332,18 @@ func (c *gRPCController) run() {
 					defer c.wg.Done()
 					ticker := time.NewTicker(tt)
 					defer ticker.Stop()
+					name := c.getName()
 					for {
 						select {
 						case <-ticker.C:
+							start := time.Now()
 							err := c.unary(c.ctx, cli)
+							grpcRequestDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
 							if err != nil {
-								log.Error("meet error when doing gRPC request", zap.String("case", c.getName()), zap.Error(err))
+								grpcRequestCount.WithLabelValues(name, "error").Inc()
+								log.Error("meet error when doing gRPC request", zap.String("case", name), zap.Error(err))
+							} else {
+								grpcRequestCount.WithLabelValues(name, "success").Inc()
 							}
 						case <-c.ctx.Done():
 							log.Info("got signal to exit running gRPC case")
@@ -372,17 +405,24 @@ func (c *directGRPCController) run() {
 					defer c.wg.Done()
 					ticker := time.NewTicker(tt)
 					defer ticker.Stop()
+					name := c.getName()
 					for {
 						select {
 						case <-ticker.C:
+							start := time.Now()
 							pdClient, healthClient, err := buildDirectClients(cli)
 							if err != nil {
-								log.Error("create direct gRPC client failed", zap.String("case", c.getName()), zap.Error(err))
+								grpcRequestCount.WithLabelValues(name, "error").Inc()
+								log.Error("create direct gRPC client failed", zap.String("case", name), zap.Error(err))
 								continue
 							}
 							err = c.unaryDirect(c.ctx, pdClient, healthClient)
+							grpcRequestDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
 							if err != nil {
-								log.Error("meet error when doing direct gRPC request", zap.String("case", c.getName()), zap.Error(err))
+								grpcRequestCount.WithLabelValues(name, "error").Inc()
+								log.Error("meet error when doing direct gRPC request", zap.String("case", name), zap.Error(err))
+							} else {
+								grpcRequestCount.WithLabelValues(name, "success").Inc()
 							}
 						case <-c.ctx.Done():
 							log.Info("got signal to exit running direct gRPC case")

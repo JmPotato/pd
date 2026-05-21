@@ -33,6 +33,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/log"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
@@ -73,10 +74,40 @@ var (
 	keyspaceID                     = flag.Uint("keyspace-id", 0, "the id of the keyspace to access")
 	keyspaceName                   = flag.String("keyspace-name", "", "the name of the keyspace to access")
 	useTSOServerProxy              = flag.Bool("use-tso-server-proxy", false, "whether send tso requests to tso server proxy instead of tso service directly")
+	statusAddr                     = flag.String("status-addr", "0.0.0.0:20182", "status address that exposes /metrics for client-perceived reconnect/error counters (v3.1)")
 	wg                             sync.WaitGroup
 )
 
 var promServer *httptest.Server
+
+// v3.1 (2026-05-21): expose client-perceived stream reconnect + error counters
+// so ops_tail_errs_sidecar.py can join them with operator events at collect time.
+var (
+	tsoStreamReconnects = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "pd_tso_bench",
+			Name:      "stream_reconnects_total",
+			Help:      "Direct TSO stream reconnect count (sum across all streams).",
+		})
+	tsoStreamErrors = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "pd_tso_bench",
+			Name:      "stream_errors_total",
+			Help:      "Direct TSO stream error count (sum across all streams).",
+		})
+	tsoStreamSuccess = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "pd_tso_bench",
+			Name:      "stream_success_total",
+			Help:      "Direct TSO logical TS successfully obtained.",
+		})
+)
+
+func init() {
+	prometheus.MustRegister(tsoStreamReconnects)
+	prometheus.MustRegister(tsoStreamErrors)
+	prometheus.MustRegister(tsoStreamSuccess)
+}
 
 type tsoStreamConfig struct {
 	DirectStreamMode    bool
@@ -151,6 +182,20 @@ func main() {
 		<-sc
 		cancel()
 	}()
+
+	// v3.1 (2026-05-21): /metrics status server (covers both direct-stream and
+	// classic bench modes). Independent of bench()'s in-process httptest server
+	// so ops_tail_errs_sidecar.py can scrape it the whole run.
+	if *statusAddr != "" {
+		go func() {
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", promhttp.Handler())
+			log.Info("tso-bench status server starting", zap.String("addr", *statusAddr))
+			if err := http.ListenAndServe(*statusAddr, mux); err != nil {
+				log.Warn("tso-bench status server exited", zap.Error(err))
+			}
+		}()
+	}
 
 	for i := range *count {
 		fmt.Printf("\nStart benchmark #%d, duration: %+vs\n", i, duration.Seconds())
@@ -269,6 +314,8 @@ func runDirectTSOStream(
 			}
 			stats.reconnects.Add(1)
 			stats.errors.Add(1)
+			tsoStreamReconnects.Inc()
+			tsoStreamErrors.Inc()
 			log.Error("direct TSO stream disconnected", zap.Int("client", clientIdx), zap.Int("stream", streamIdx), zap.Error(err))
 		}
 		select {
@@ -326,7 +373,9 @@ func runOneDirectTSOStream(
 		if err != nil {
 			return err
 		}
-		stats.successCount.Add(int64(resp.GetCount()))
+		count := int64(resp.GetCount())
+		stats.successCount.Add(count)
+		tsoStreamSuccess.Add(float64(count))
 	}
 }
 

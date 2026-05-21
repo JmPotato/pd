@@ -59,7 +59,9 @@ const (
 	// active" — leaving the other ~92 stores' gRPC handler goroutines parked, which is
 	// the structural prerequisite for idle P → findRunnableGCWorker → lfstack contention
 	// seen in online stepdown. Mutually exclusive with smooth-heartbeat-pacing.
-	defaultStaggerBurst = false
+	defaultStaggerBurst          = false
+	defaultAutoReconnect         = true
+	defaultFullResendOnReconnect = true
 
 	// v2.5 (2026-05-20): burst-cycle — overlay a wall-clock-phase-aware fraction on
 	// each outer-tick's effective region count, modelling the COLLECTIVE 10-min burst
@@ -180,6 +182,22 @@ type Config struct {
 	// SmoothHeartbeatPacing (Validate enforces this).
 	StaggerBurst bool `toml:"stagger-burst" json:"stagger-burst"`
 
+	// AutoReconnect (v3.1, 2026-05-21): when a per-store RegionHeartbeat stream
+	// returns an error (typically io.EOF or "not leader" after PD leader transfer),
+	// transparently re-acquire a new stream from the same cli (which internally
+	// follows the new leader via service discovery). Without this, the v3.0 worker
+	// would return on first send error and silently stop heartbeating that store
+	// for the remainder of the run.
+	AutoReconnect bool `toml:"auto-reconnect" json:"auto-reconnect"`
+
+	// FullResendOnReconnect (v3.1, 2026-05-21): immediately after AutoReconnect
+	// re-acquires a stream, mark the worker so its next round bypasses the
+	// burst-cycle fraction trim and pacing and burst-sends ALL regions owned by
+	// that store. Mirrors real TiKV behaviour: on PD reconnect event TiKV pushes
+	// a full region heartbeat round, producing the post-stepdown spike observed
+	// online (e.g. cluster 10989049060142230334 at 14:10 / 14:18 stepdowns).
+	FullResendOnReconnect bool `toml:"full-resend-on-reconnect" json:"full-resend-on-reconnect"`
+
 	// BurstCycle (v2.5, 2026-05-20): overlay a wall-clock-phase-aware fraction on each
 	// outer-tick's effective region count, reproducing the online 10-min collective
 	// burst cycle (see Clinic PromQL on cluster 10989049060142230334). When enabled,
@@ -227,7 +245,9 @@ func NewConfig() *Config {
 	fs.IntVar(&cfg.StoreCapacityGiB, "store-capacity-gib", 0, "per-store capacity in GiB; 0 auto-computes from region count")
 	fs.BoolVar(&cfg.BucketsAfterFirstHeartbeatRound, "buckets-after-first-heartbeat-round", defaultBucketsAfterFirstHeartbeat, "gate ReportBuckets workers on first heartbeat round complete (fixes race)")
 	fs.BoolVar(&cfg.SmoothHeartbeatPacing, "smooth-heartbeat-pacing", defaultSmoothHeartbeatPacing, "spread per-store region heartbeats uniformly across the outer-tick window with ±10%% jitter (v2.3 experimental); false = legacy bursty")
-	fs.BoolVar(&cfg.StaggerBurst, "stagger-burst", defaultStaggerBurst, "stagger per-store burst start by (id-1)*outer_tick/StoreCount (v2.4); each store still bursts its regions tightly. Mimics real-TiKV ticker stagger to leave idle P for findRunnableGCWorker. Mutually exclusive with smooth-heartbeat-pacing.")
+	fs.BoolVar(&cfg.StaggerBurst, "stagger-burst", defaultStaggerBurst, "stagger per-store startup by (id-1)*outer_tick/StoreCount (v2.4, rewritten v3.1 to be a startup-only phase offset that composes with smooth-pacing and burst-cycle)")
+	fs.BoolVar(&cfg.AutoReconnect, "auto-reconnect", defaultAutoReconnect, "re-acquire RegionHeartbeat stream on send error (typically PD leader transfer / not-leader). (v3.1)")
+	fs.BoolVar(&cfg.FullResendOnReconnect, "full-resend-on-reconnect", defaultFullResendOnReconnect, "burst-send all regions on the round after a reconnect, bypassing burst-cycle fraction and pacing. Models TiKV leader-transfer-driven full heartbeat resend. Requires --auto-reconnect. (v3.1)")
 	fs.BoolVar(&cfg.BurstCycle, "burst-cycle", defaultBurstCycle, "overlay wall-clock-phase-aware fraction on per-tick region count to reproduce online 10-min collective burst cycle (v2.5). Requires smooth-heartbeat-pacing=true.")
 	fs.IntVar(&cfg.BurstCyclePeriodSec, "burst-cycle-period-sec", defaultBurstCyclePeriodSec, "burst cycle total period in seconds (v2.5; default 600 = online 10 min)")
 	fs.IntVar(&cfg.BurstCycleHighSec, "burst-cycle-high-sec", defaultBurstCycleHighSec, "burst cycle HIGH segment duration in seconds (v2.5; default 60)")
@@ -336,6 +356,12 @@ func (c *Config) Adjust(meta *toml.MetaData) {
 	}
 	if !isDefined(meta, "stagger-burst") {
 		c.StaggerBurst = defaultStaggerBurst
+	}
+	if !isDefined(meta, "auto-reconnect") {
+		c.AutoReconnect = defaultAutoReconnect
+	}
+	if !isDefined(meta, "full-resend-on-reconnect") {
+		c.FullResendOnReconnect = defaultFullResendOnReconnect
 	}
 	if !isDefined(meta, "burst-cycle") {
 		c.BurstCycle = defaultBurstCycle
@@ -446,13 +472,14 @@ func (c *Config) Validate() error {
 	if c.HotRegionRatio < 0 || c.HotRegionRatio > 1 {
 		return errors.Errorf("hot-region-ratio must be in [0, 1]")
 	}
-	if c.SmoothHeartbeatPacing && c.StaggerBurst {
-		return errors.Errorf("smooth-heartbeat-pacing and stagger-burst are mutually exclusive")
-	}
+	// v3.0.3 (2026-05-21): stagger-burst is orthogonal to smooth-pacing and
+	// burst-cycle — it only delays each store-worker's start by (i-1)*tick/N.
+	// With smooth-pacing on, the worker still spreads its regions uniformly
+	// over the outer tick; stagger just shifts the phase across stores so the
+	// per-store send pattern matches the online cluster (Grafana "Region
+	// heartbeat report" shows clear cross-store phase offset). Original v2.4
+	// mutex assumption (stagger == burst-once-per-tick) no longer holds.
 	if c.BurstCycle {
-		if c.StaggerBurst {
-			return errors.Errorf("burst-cycle and stagger-burst are mutually exclusive")
-		}
 		if !c.SmoothHeartbeatPacing {
 			return errors.Errorf("burst-cycle requires smooth-heartbeat-pacing=true so the (variable) per-tick region count is spread uniformly across the outer-tick window")
 		}

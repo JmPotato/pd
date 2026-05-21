@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -39,6 +40,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/log"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
 	"github.com/tikv/pd/client/grpcutil"
 	pdHttp "github.com/tikv/pd/client/http"
@@ -51,6 +53,7 @@ import (
 	"github.com/tikv/pd/tools/pd-heartbeat-bench/metrics"
 	"go.etcd.io/etcd/pkg/v3/report"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -66,6 +69,38 @@ const (
 	storeReportInterval  = 10 // 10s
 	legacyCapacity       = 4 * units.TiB
 )
+
+// v3.1 (2026-05-21): client-perceived reconnect + error counters. Exported on
+// the gin /metrics endpoint (default prometheus registry), so the bench-side
+// ops_tail_errs_sidecar.py can join them with operator events at collect time.
+// store_id label kept low-cardinality (100 stores), well within Prometheus
+// scrape budget.
+var (
+	heartbeatStreamReconnects = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "pd_heartbeat_bench",
+			Name:      "stream_reconnects_total",
+			Help:      "RegionHeartbeat stream reconnect count, per store.",
+		}, []string{"store_id"})
+	heartbeatStreamErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "pd_heartbeat_bench",
+			Name:      "stream_errors_total",
+			Help:      "RegionHeartbeat stream send/reconnect error count, per store and phase (send_initial, send_retry, reconnect_failed).",
+		}, []string{"store_id", "phase"})
+	heartbeatFullResendRounds = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "pd_heartbeat_bench",
+			Name:      "full_resend_rounds_total",
+			Help:      "Full heartbeat resend rounds triggered by stream reconnect (TiKV-style burst).",
+		})
+)
+
+func init() {
+	prometheus.MustRegister(heartbeatStreamReconnects)
+	prometheus.MustRegister(heartbeatStreamErrors)
+	prometheus.MustRegister(heartbeatFullResendRounds)
+}
 
 // computeStoreCapacity returns the per-store capacity bytes. If cfg.StoreCapacityGiB > 0 it is
 // honoured; otherwise we auto-scale to 2x the per-store live data (RegionCount * Replica *
@@ -119,7 +154,14 @@ func newClient(ctx context.Context, cfg *config.Config) (pdpb.PDClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	cc, err := grpcutil.GetClientConn(ctx, cfg.PDAddr, tlsConfig)
+	// v3.1.3: cfg.PDAddr may be comma-separated multi-endpoint. grpcutil
+	// expects single host:port, so use the first; leader-aware streamSlot
+	// rediscovers and rebuilds against the real leader afterwards.
+	addr := cfg.PDAddr
+	if strings.Contains(addr, ",") {
+		addr = strings.TrimSpace(strings.Split(addr, ",")[0])
+	}
+	cc, err := grpcutil.GetClientConn(ctx, addr, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -496,6 +538,421 @@ func createHeartbeatStream(ctx context.Context, cfg *config.Config) (pdpb.PDClie
 		}
 	}()
 	return cli, stream
+}
+
+// streamSlot (v3.1.3, 2026-05-21) wraps a per-store RegionHeartbeat stream with
+// **leader-aware** reconnect support. send() and drainRecv() detect a broken
+// stream (PD silently closes after leader transfer); reconnect() rediscovers
+// the current PD leader and rebuilds cli+stream against the new leader endpoint,
+// because raw pdpb.PDClient has no service discovery and would otherwise loop
+// forever connecting to the stale ex-leader.
+type streamSlot struct {
+	storeID uint64
+	cfg     *config.Config
+	ctx     context.Context
+
+	mu               sync.Mutex
+	cli              pdpb.PDClient
+	cc               *grpc.ClientConn // tracked so we can Close() on rebuild
+	currentEp        string           // host:port of the endpoint cli is bound to
+	stream           pdpb.PD_RegionHeartbeatClient
+	fullResendNeeded atomic.Bool
+	reconnects       atomic.Uint64
+}
+
+// resolvePDLeader (v3.1.3) discovers the current PD leader endpoint by trying
+// each configured endpoint in turn. Returns (leader_endpoint, leader_cc,
+// leader_cli, nil) on success.
+func resolvePDLeader(ctx context.Context, cfg *config.Config) (string, *grpc.ClientConn, pdpb.PDClient, error) {
+	tlsConfig, err := cfg.Security.ToTLSConfig()
+	if err != nil {
+		return "", nil, nil, err
+	}
+	eps := strings.Split(cfg.PDAddr, ",")
+	var lastErr error
+	for _, ep := range eps {
+		ep = strings.TrimSpace(ep)
+		if ep == "" {
+			continue
+		}
+		cc, err := grpcutil.GetClientConn(ctx, ep, tlsConfig)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		cli := pdpb.NewPDClient(cc)
+		resp, err := cli.GetMembers(ctx, &pdpb.GetMembersRequest{})
+		if err != nil || resp == nil || resp.Leader == nil || len(resp.Leader.ClientUrls) == 0 {
+			cc.Close()
+			if err == nil {
+				err = stderrors.New("no leader info in GetMembers response")
+			}
+			lastErr = err
+			continue
+		}
+		leaderURL := resp.Leader.ClientUrls[0]
+		leaderEp := strings.TrimPrefix(strings.TrimPrefix(leaderURL, "https://"), "http://")
+		if leaderEp == ep {
+			return ep, cc, cli, nil
+		}
+		// Reached a follower; connect directly to leader.
+		cc.Close()
+		leaderCc, err := grpcutil.GetClientConn(ctx, leaderEp, tlsConfig)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return leaderEp, leaderCc, pdpb.NewPDClient(leaderCc), nil
+	}
+	if lastErr == nil {
+		lastErr = stderrors.New("no PD endpoint reachable")
+	}
+	return "", nil, nil, lastErr
+}
+
+func newStreamSlot(ctx context.Context, cfg *config.Config, storeID uint64) *streamSlot {
+	ep, cc, cli, err := resolvePDLeader(ctx, cfg)
+	if err != nil {
+		log.Fatal("resolve PD leader error", zap.Uint64("store-id", storeID), zap.Error(err))
+	}
+	stream, err := cli.RegionHeartbeat(ctx)
+	if err != nil {
+		log.Fatal("create stream error", zap.Uint64("store-id", storeID), zap.Error(err))
+	}
+	s := &streamSlot{storeID: storeID, cfg: cfg, ctx: ctx, cli: cli, cc: cc, currentEp: ep, stream: stream}
+	go s.drainRecv(stream)
+	return s
+}
+
+// drainRecv consumes Recv() responses until the stream errors out. PD closes
+// the stream silently on leader transfer (no error on the client send-side
+// because the local buffer keeps accepting writes), so we MUST use Recv() as
+// the authoritative liveness signal. v3.1.3: add 200-500ms randomised backoff
+// before triggering reconnect to avoid hot loop when a freshly-built stream
+// EOFs immediately (this happens when raw cli is bound to ex-leader; reconnect
+// will rediscover leader and rebuild cli).
+func (s *streamSlot) drainRecv(stream pdpb.PD_RegionHeartbeatClient) {
+	for {
+		_, err := stream.Recv()
+		if err == nil {
+			continue
+		}
+		s.mu.Lock()
+		stillActive := s.stream == stream
+		s.mu.Unlock()
+		if !stillActive {
+			return
+		}
+		// Randomised backoff: prevents 100 stores from synchronously reconnect-
+		// storming PD right after a leader transfer.
+		time.Sleep(time.Duration(200+rand.Intn(300)) * time.Millisecond)
+		s.mu.Lock()
+		stillActive = s.stream == stream
+		s.mu.Unlock()
+		if !stillActive {
+			return
+		}
+		if s.cfg.AutoReconnect {
+			if rerr := s.reconnect(); rerr != nil {
+				heartbeatStreamErrors.WithLabelValues(strconv.FormatUint(s.storeID, 10), "drainrecv_reconnect_failed").Inc()
+				log.Warn("drainRecv reconnect failed", zap.Uint64("store-id", s.storeID), zap.Error(rerr))
+			}
+		}
+		return
+	}
+}
+
+// send attempts stream.Send(req); on error, if AutoReconnect is enabled it
+// re-acquires the stream and retries once. Caller-visible error means
+// reconnect itself failed (rare) or retry-send failed.
+func (s *streamSlot) send(req *pdpb.RegionHeartbeatRequest) error {
+	s.mu.Lock()
+	err := s.stream.Send(req)
+	s.mu.Unlock()
+	if err == nil {
+		return nil
+	}
+	storeLabel := strconv.FormatUint(s.storeID, 10)
+	heartbeatStreamErrors.WithLabelValues(storeLabel, "send_initial").Inc()
+	if !s.cfg.AutoReconnect {
+		return err
+	}
+	log.Warn("region heartbeat stream send error, attempting reconnect",
+		zap.Uint64("store-id", s.storeID), zap.Error(err))
+	if rerr := s.reconnect(); rerr != nil {
+		heartbeatStreamErrors.WithLabelValues(storeLabel, "reconnect_failed").Inc()
+		return rerr
+	}
+	s.mu.Lock()
+	err = s.stream.Send(req)
+	s.mu.Unlock()
+	if err != nil {
+		heartbeatStreamErrors.WithLabelValues(storeLabel, "send_retry").Inc()
+	}
+	return err
+}
+
+func (s *streamSlot) reconnect() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.stream.CloseSend()
+	// v3.1.3: rediscover leader and rebuild cli if it moved. Without this, raw
+	// pdpb.PDClient stays bound to the ex-leader endpoint forever and every
+	// new stream EOFs instantly. resolvePDLeader probes each configured
+	// endpoint until one returns leader info, then connects directly to leader.
+	newEp, newCc, newCli, err := resolvePDLeader(s.ctx, s.cfg)
+	if err != nil {
+		// Fall back to existing cli — better than nothing.
+		log.Warn("resolvePDLeader failed during reconnect, retrying on existing cli",
+			zap.Uint64("store-id", s.storeID), zap.Error(err))
+	} else if newEp != s.currentEp {
+		if s.cc != nil {
+			_ = s.cc.Close()
+		}
+		s.cc = newCc
+		s.cli = newCli
+		s.currentEp = newEp
+		log.Info("PD leader endpoint switched",
+			zap.Uint64("store-id", s.storeID), zap.String("new-endpoint", newEp))
+	} else {
+		// Same leader as before — release the freshly-built cc, keep current cli.
+		_ = newCc.Close()
+	}
+	newStream, err := s.cli.RegionHeartbeat(s.ctx)
+	if err != nil {
+		return err
+	}
+	s.stream = newStream
+	s.reconnects.Add(1)
+	heartbeatStreamReconnects.WithLabelValues(strconv.FormatUint(s.storeID, 10)).Inc()
+	if s.cfg.FullResendOnReconnect {
+		s.fullResendNeeded.Store(true)
+	}
+	go s.drainRecv(newStream)
+	log.Info("region heartbeat stream reconnected",
+		zap.Uint64("store-id", s.storeID),
+		zap.String("endpoint", s.currentEp),
+		zap.Uint64("total-reconnects", s.reconnects.Load()),
+		zap.Bool("full-resend-on-next-round", s.cfg.FullResendOnReconnect))
+	return nil
+}
+
+// storeRoundStat aggregates one store's per-round counters for the cluster-wide
+// stats reporter goroutine. Lossy delivery (non-blocking send) is fine since
+// PD-side Prometheus is the canonical metric source.
+type storeRoundStat struct {
+	storeID    uint64
+	sent       int
+	errs       int
+	elapsed    time.Duration
+	fullResend bool
+}
+
+// runStoreWorker (v3.1) replaces the global ticker + wg.Wait model. Each store
+// has its own ticker, started after a phase offset, so PD sees a continuous
+// stream of heartbeats from a rolling subset of stores instead of cluster-wide
+// synchronized rounds. Sends FullResend (= ignore burst-cycle fraction + skip
+// pacing, burst all regions) on the round immediately following a stream
+// reconnect.
+func runStoreWorker(
+	ctx context.Context,
+	cfg *config.Config,
+	rs *Regions,
+	slot *streamSlot,
+	storeID uint64,
+	startDelay time.Duration,
+	tickInterval time.Duration,
+	firstRoundCh chan<- struct{},
+	statsCh chan<- storeRoundStat,
+) {
+	if startDelay > 0 {
+		select {
+		case <-time.After(startDelay):
+		case <-ctx.Done():
+			return
+		}
+	}
+	runOneRound(ctx, cfg, rs, slot, storeID, tickInterval, statsCh)
+	select {
+	case firstRoundCh <- struct{}{}:
+	default:
+	}
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			runOneRound(ctx, cfg, rs, slot, storeID, tickInterval, statsCh)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func runOneRound(
+	ctx context.Context,
+	cfg *config.Config,
+	rs *Regions,
+	slot *streamSlot,
+	storeID uint64,
+	paceInterval time.Duration,
+	statsCh chan<- storeRoundStat,
+) {
+	fullResend := slot.fullResendNeeded.CompareAndSwap(true, false)
+
+	var regions, toUpdate []*pdpb.RegionHeartbeatRequest
+	updatedRegions := rs.awakenRegions.Load()
+	if updatedRegions == nil {
+		toUpdate = rs.regions
+	} else {
+		toUpdate = updatedRegions.([]*pdpb.RegionHeartbeatRequest)
+	}
+	for _, region := range toUpdate {
+		if region.Leader.StoreId == storeID {
+			regions = append(regions, region)
+		}
+	}
+
+	// v3.1.1 (2026-05-21): burst-cycle fraction is ALWAYS applied, even on
+	// FullResend. Real TiKV after PD reconnect bursts its currently-owned region
+	// set, not "all regions ever known", so the active-region fraction modelled
+	// by burst-cycle is still the right population to send. Skipping fraction
+	// inflated per-store ops/min to ~109k (full 81595 regions/min) vs online
+	// peak of ~68k — corrected to ~44k = 81595 × 0.54 fraction here.
+	if cfg.BurstCycle && len(regions) > 0 {
+		fraction := computeBurstCycleFraction(cfg, time.Now())
+		effective := int(float64(len(regions)) * fraction)
+		if effective < 1 {
+			effective = 1
+		}
+		if effective < len(regions) {
+			startOff := 0
+			if span := len(regions) - effective; span > 0 {
+				startOff = rand.Intn(span + 1)
+			}
+			regions = regions[startOff : startOff+effective]
+		}
+	}
+
+	perRegionDelay := computeSmoothPaceDelay(cfg, paceInterval, len(regions))
+	if fullResend {
+		// Full resend on reconnect: skip inter-region pacing so the per-store
+		// burst window matches real TiKV reconnect behaviour. Fraction stays so
+		// the burst contains the same number of regions a normal round would.
+		perRegionDelay = 0
+	}
+
+	start := time.Now()
+	sent, errs := 0, 0
+	lastIdx := len(regions) - 1
+	for i, region := range regions {
+		if err := slot.send(region); err != nil {
+			errs++
+			log.Warn("region heartbeat send failed after reconnect",
+				zap.Uint64("store-id", storeID), zap.Error(err))
+			break
+		}
+		sent++
+		if perRegionDelay > 0 && i < lastIdx {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(paceJitter(perRegionDelay)):
+			}
+		}
+	}
+	elapsed := time.Since(start)
+	if fullResend {
+		heartbeatFullResendRounds.Inc()
+		log.Info("full heartbeat resend round complete (post-reconnect)",
+			zap.Uint64("store-id", storeID),
+			zap.Int("regions-sent", sent),
+			zap.Int("errors", errs),
+			zap.Duration("elapsed", elapsed))
+	}
+	select {
+	case statsCh <- storeRoundStat{storeID, sent, errs, elapsed, fullResend}:
+	default:
+	}
+}
+
+// runClusterUpdater drives cluster-wide region/store state mutations on a
+// single tick (the original code did this once per global heartbeat round; with
+// per-store tickers we need an explicit driver since there's no shared barrier).
+func runClusterUpdater(
+	ctx context.Context,
+	cfg *config.Config,
+	rs *Regions,
+	stores *Stores,
+	options *config.Options,
+	tickInterval time.Duration,
+) {
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if cfg.Round != 0 && rs.updateRound > cfg.Round {
+				exit(0)
+			}
+			rs.update(cfg, options)
+			go stores.update(rs)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// runStatsReporter aggregates per-store round stats and emits a summary every
+// tickInterval. Replaces the in-loop log.Info("region heartbeat stats", ...).
+func runStatsReporter(
+	ctx context.Context,
+	statsCh <-chan storeRoundStat,
+	interval time.Duration,
+) {
+	var (
+		mu              sync.Mutex
+		totalSent       int
+		totalErrs       int
+		roundsFinished  int
+		maxElapsed      time.Duration
+		fullResendCount int
+	)
+	go func() {
+		for s := range statsCh {
+			mu.Lock()
+			totalSent += s.sent
+			totalErrs += s.errs
+			roundsFinished++
+			if s.elapsed > maxElapsed {
+				maxElapsed = s.elapsed
+			}
+			if s.fullResend {
+				fullResendCount++
+			}
+			mu.Unlock()
+		}
+	}()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			mu.Lock()
+			log.Info("region heartbeat stats (per-store ticker, v3.1)",
+				zap.Int("rounds-finished", roundsFinished),
+				zap.Int("regions-sent", totalSent),
+				zap.Int("errors", totalErrs),
+				zap.Duration("max-store-elapsed", maxElapsed),
+				zap.Float64("aggregate-rps", float64(totalSent)/interval.Seconds()),
+				zap.Int("full-resend-rounds", fullResendCount))
+			totalSent, totalErrs, roundsFinished, fullResendCount = 0, 0, 0, 0
+			maxElapsed = 0
+			mu.Unlock()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // computeSmoothPaceDelay returns the per-region sleep used in smooth pacing mode.
@@ -1013,38 +1470,37 @@ func main() {
 	bootstrap(ctx, cli)
 	putStores(ctx, cfg, cli, stores)
 	log.Info("finish put stores")
-	clis := make(map[uint64]pdpb.PDClient, cfg.StoreCount)
 	httpCli := pdHttp.NewClient("tools-heartbeat-bench", []string{cfg.PDAddr}, pdHttp.WithTLSConfig(loadTLSConfig(cfg)))
 	go deleteOperators(ctx, httpCli)
-	streams := make(map[uint64]pdpb.PD_RegionHeartbeatClient, cfg.StoreCount)
+
+	// v3.1 (2026-05-21): per-store stream slots with auto-reconnect. clis is
+	// retained as a separate map because runMinResolvedTSReporter and the
+	// bucket worker factory still consume bare PDClients.
+	slots := make(map[uint64]*streamSlot, cfg.StoreCount)
+	clis := make(map[uint64]pdpb.PDClient, cfg.StoreCount)
 	for i := 1; i <= cfg.StoreCount; i++ {
-		clis[uint64(i)], streams[uint64(i)] = createHeartbeatStream(ctx, cfg)
+		id := uint64(i)
+		slots[id] = newStreamSlot(ctx, cfg, id)
+		clis[id] = slots[id].cli
 	}
 	header := &pdpb.RequestHeader{
 		ClusterId: clusterID,
 	}
 	heartbeatTickInterval := intervalForAggregateQPS(cfg.RegionHeartbeatQPS, cfg.RegionCount, regionReportInterval*time.Second)
-	heartbeatTicker := time.NewTicker(heartbeatTickInterval)
-	defer heartbeatTicker.Stop()
 	if cfg.SmoothHeartbeatPacing {
 		log.Info("smooth heartbeat pacing enabled",
 			zap.Duration("outer-tick-interval", heartbeatTickInterval),
 			zap.Int("region-count", cfg.RegionCount),
 			zap.Int("store-count", cfg.StoreCount))
 	}
-	// v2.4 (2026-05-20): stagger-burst delays each store-worker by
-	// (id-1) * outer_tick / StoreCount so that one store fires every
-	// outer_tick / StoreCount seconds — mimicking how 100 independent
-	// TiKV region-heartbeat tickers naturally stagger.
 	var staggerStep time.Duration
 	if cfg.StaggerBurst && cfg.StoreCount > 0 {
 		staggerStep = heartbeatTickInterval / time.Duration(cfg.StoreCount)
-		log.Info("stagger-burst enabled",
+		log.Info("stagger-burst enabled (per-store startup phase offset, v3.1)",
 			zap.Duration("outer-tick-interval", heartbeatTickInterval),
 			zap.Duration("stagger-step", staggerStep),
 			zap.Int("store-count", cfg.StoreCount))
 	}
-	// v2.5 (2026-05-20): collective burst cycle config snapshot for visibility.
 	if cfg.BurstCycle {
 		log.Info("burst-cycle enabled",
 			zap.Int("period-sec", cfg.BurstCyclePeriodSec),
@@ -1052,6 +1508,12 @@ func main() {
 			zap.Int("ramp-sec", cfg.BurstCycleRampSec),
 			zap.Float64("high-fraction", cfg.BurstCycleHighFraction),
 			zap.Float64("low-fraction", cfg.BurstCycleLowFraction))
+	}
+	if cfg.AutoReconnect {
+		log.Info("auto-reconnect enabled (leader-transfer-driven stream resync, v3.1)")
+	}
+	if cfg.FullResendOnReconnect {
+		log.Info("full-resend-on-reconnect enabled (TiKV-style burst after reconnect, v3.1)")
 	}
 	runMinResolvedTSReporter(ctx, cfg.StoreCount, intervalForAggregateQPS(cfg.ReportMinResolvedTSQPS, cfg.StoreCount, time.Second), func(ctx context.Context, id uint64) error {
 		cli := clis[id]
@@ -1063,9 +1525,6 @@ func main() {
 		return err
 	})
 	bucketStatus := newBucketReporterStatus()
-	// v2.1 (2026-05-20): when configured, gate bucket workers on first heartbeat round to
-	// avoid the bucket-arrives-before-region race documented in (f). gate=nil disables the
-	// gate (legacy racing behaviour).
 	var bucketGate chan struct{}
 	if cfg.BucketsAfterFirstHeartbeatRound {
 		bucketGate = make(chan struct{})
@@ -1079,71 +1538,46 @@ func main() {
 		newReportBucketsStreamFactory(cli),
 		bucketGate,
 	)
-	withMetric := metrics.InitMetric2Collect(cfg.MetricsAddr)
-	firstRoundDone := false
-	for {
-		select {
-		case <-heartbeatTicker.C:
-			if cfg.Round != 0 && regions.updateRound > cfg.Round {
-				exit(0)
-			}
-			rep := newReport(cfg)
-			r := rep.Stats()
+	metrics.InitMetric2Collect(cfg.MetricsAddr)
 
-			startTime := time.Now()
-			wg := &sync.WaitGroup{}
-			for i := 1; i <= cfg.StoreCount; i++ {
-				id := uint64(i)
-				wg.Add(1)
-				if staggerStep > 0 {
-					delay := staggerStep * time.Duration(i-1)
-					go func(id uint64, delay time.Duration) {
-						select {
-						case <-time.After(delay):
-						case <-ctx.Done():
-							wg.Done()
-							return
-						}
-						regions.handleRegionHeartbeat(ctx, cfg, wg, streams[id], id, rep, heartbeatTickInterval)
-					}(id, delay)
-				} else {
-					go regions.handleRegionHeartbeat(ctx, cfg, wg, streams[id], id, rep, heartbeatTickInterval)
-				}
-			}
-			if withMetric {
-				metrics.CollectMetrics(regions.updateRound, time.Second)
-			}
-			wg.Wait()
+	// v3.1 main loop: per-store ticker + cluster updater + stats reporter.
+	statsCh := make(chan storeRoundStat, cfg.StoreCount*4)
+	go runStatsReporter(ctx, statsCh, heartbeatTickInterval)
+	go runClusterUpdater(ctx, cfg, regions, stores, options, heartbeatTickInterval)
 
-			// v2.1 (2026-05-20): release bucket workers exactly once after the first
-			// completed heartbeat round. Subsequent rounds are no-ops.
-			if !firstRoundDone {
-				firstRoundDone = true
-				if bucketGate != nil {
-					close(bucketGate)
-					log.Info("first heartbeat round complete; releasing report-buckets workers")
-				}
-			}
-
-			since := time.Since(startTime).Seconds()
-			close(rep.Results())
-			regions.result(cfg.RegionCount, since)
-			stats := <-r
-			log.Info("region heartbeat stats",
-				metrics.RegionFields(stats, zap.Uint64("max-epoch-version", maxVersion))...)
-			log.Info("store heartbeat stats", zap.String("max", fmt.Sprintf("%.4fs", since)))
-			metrics.CollectRegionAndStoreStats(&stats, &since)
-			regions.update(cfg, options)
-			go stores.update(regions) // update stores in background, unusually region heartbeat is slower than store update.
-		case <-ctx.Done():
-			log.Info("got signal to exit")
-			switch sig {
-			case syscall.SIGTERM:
-				exit(0)
-			default:
-				exit(1)
+	firstRoundCh := make(chan struct{}, cfg.StoreCount)
+	go func() {
+		// Wait for all stores to finish their first round, then unblock bucket
+		// workers exactly once (replaces the in-loop firstRoundDone flag).
+		for i := 0; i < cfg.StoreCount; i++ {
+			select {
+			case <-firstRoundCh:
+			case <-ctx.Done():
+				return
 			}
 		}
+		if bucketGate != nil {
+			close(bucketGate)
+			log.Info("first heartbeat round complete on all stores; releasing report-buckets workers")
+		}
+	}()
+
+	for i := 1; i <= cfg.StoreCount; i++ {
+		id := uint64(i)
+		startDelay := time.Duration(0)
+		if staggerStep > 0 {
+			startDelay = staggerStep * time.Duration(i-1)
+		}
+		go runStoreWorker(ctx, cfg, regions, slots[id], id, startDelay, heartbeatTickInterval, firstRoundCh, statsCh)
+	}
+
+	<-ctx.Done()
+	log.Info("got signal to exit")
+	switch sig {
+	case syscall.SIGTERM:
+		exit(0)
+	default:
+		exit(1)
 	}
 }
 
