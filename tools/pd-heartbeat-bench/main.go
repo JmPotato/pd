@@ -524,6 +524,42 @@ func computeSmoothPaceDelay(cfg *config.Config, paceInterval time.Duration, regi
 	return d
 }
 
+// v2.5 (2026-05-20): collective burst cycle phase math — see config doc.
+// Returns the report fraction in [0, 1] for the given wall-clock time. Returns
+// 1.0 when burst-cycle is disabled (caller will then send the whole region slice).
+// Phase layout (sec = wall_clock_unix mod BurstCyclePeriodSec):
+//   [0, HighSec)                         → HighFraction
+//   [HighSec, HighSec + RampSec)         → linear interp High → Low
+//   [HighSec + RampSec, Period - RampSec)→ LowFraction
+//   [Period - RampSec, Period)           → linear interp Low → High
+// Matches the structure observed on online cluster 10989049060142230334 via Clinic
+// PromQL pd_scheduler_region_heartbeat{type="report"}: 10 min cycle with ~1 min HIGH
+// peaking at 74 K hb/s aggregate, ~7 min LOW at 39 K hb/s, ~1 min linear ramp each side.
+func computeBurstCycleFraction(cfg *config.Config, now time.Time) float64 {
+	if !cfg.BurstCycle || cfg.BurstCyclePeriodSec <= 0 {
+		return 1.0
+	}
+	period := cfg.BurstCyclePeriodSec
+	high := cfg.BurstCycleHighSec
+	ramp := cfg.BurstCycleRampSec
+	sec := now.Unix() % int64(period)
+	t := float64(sec)
+	hi := cfg.BurstCycleHighFraction
+	lo := cfg.BurstCycleLowFraction
+	switch {
+	case t < float64(high):
+		return hi
+	case t < float64(high+ramp):
+		x := (t - float64(high)) / float64(ramp)
+		return hi + (lo-hi)*x
+	case t < float64(period-ramp):
+		return lo
+	default:
+		x := (t - float64(period-ramp)) / float64(ramp)
+		return lo + (hi-lo)*x
+	}
+}
+
 // paceJitter returns a per-iteration sleep with ±10% jitter around perRegionDelay,
 // to prevent 100 stores synchronizing their inter-send sleeps and burst-firing
 // together. Returns 0 if delay is 0 (caller skips sleep entirely).
@@ -552,6 +588,26 @@ func (rs *Regions) handleRegionHeartbeat(ctx context.Context, cfg *config.Config
 			continue
 		}
 		regions = append(regions, region)
+	}
+
+	// v2.5 (2026-05-20): collective burst cycle — truncate the per-tick region slice
+	// to a wall-clock-phase-aware fraction so PD ingress rate follows the online
+	// 10-min HIGH/LOW cycle. Random starting offset keeps every region eventually
+	// reported (no permanent stale set). When burst-cycle is disabled, fraction=1.0
+	// and this block is a no-op.
+	if cfg.BurstCycle && len(regions) > 0 {
+		fraction := computeBurstCycleFraction(cfg, time.Now())
+		effective := int(float64(len(regions)) * fraction)
+		if effective < 1 {
+			effective = 1
+		}
+		if effective < len(regions) {
+			startOff := 0
+			if span := len(regions) - effective; span > 0 {
+				startOff = rand.Intn(span + 1)
+			}
+			regions = regions[startOff : startOff+effective]
+		}
 	}
 
 	// v2.3 (2026-05-20): per-region pacing. Zero delay = bursty (legacy) mode.
@@ -976,6 +1032,27 @@ func main() {
 			zap.Int("region-count", cfg.RegionCount),
 			zap.Int("store-count", cfg.StoreCount))
 	}
+	// v2.4 (2026-05-20): stagger-burst delays each store-worker by
+	// (id-1) * outer_tick / StoreCount so that one store fires every
+	// outer_tick / StoreCount seconds — mimicking how 100 independent
+	// TiKV region-heartbeat tickers naturally stagger.
+	var staggerStep time.Duration
+	if cfg.StaggerBurst && cfg.StoreCount > 0 {
+		staggerStep = heartbeatTickInterval / time.Duration(cfg.StoreCount)
+		log.Info("stagger-burst enabled",
+			zap.Duration("outer-tick-interval", heartbeatTickInterval),
+			zap.Duration("stagger-step", staggerStep),
+			zap.Int("store-count", cfg.StoreCount))
+	}
+	// v2.5 (2026-05-20): collective burst cycle config snapshot for visibility.
+	if cfg.BurstCycle {
+		log.Info("burst-cycle enabled",
+			zap.Int("period-sec", cfg.BurstCyclePeriodSec),
+			zap.Int("high-sec", cfg.BurstCycleHighSec),
+			zap.Int("ramp-sec", cfg.BurstCycleRampSec),
+			zap.Float64("high-fraction", cfg.BurstCycleHighFraction),
+			zap.Float64("low-fraction", cfg.BurstCycleLowFraction))
+	}
 	runMinResolvedTSReporter(ctx, cfg.StoreCount, intervalForAggregateQPS(cfg.ReportMinResolvedTSQPS, cfg.StoreCount, time.Second), func(ctx context.Context, id uint64) error {
 		cli := clis[id]
 		_, err := cli.ReportMinResolvedTS(ctx, &pdpb.ReportMinResolvedTsRequest{
@@ -1018,7 +1095,20 @@ func main() {
 			for i := 1; i <= cfg.StoreCount; i++ {
 				id := uint64(i)
 				wg.Add(1)
-				go regions.handleRegionHeartbeat(ctx, cfg, wg, streams[id], id, rep, heartbeatTickInterval)
+				if staggerStep > 0 {
+					delay := staggerStep * time.Duration(i-1)
+					go func(id uint64, delay time.Duration) {
+						select {
+						case <-time.After(delay):
+						case <-ctx.Done():
+							wg.Done()
+							return
+						}
+						regions.handleRegionHeartbeat(ctx, cfg, wg, streams[id], id, rep, heartbeatTickInterval)
+					}(id, delay)
+				} else {
+					go regions.handleRegionHeartbeat(ctx, cfg, wg, streams[id], id, rep, heartbeatTickInterval)
+				}
 			}
 			if withMetric {
 				metrics.CollectMetrics(regions.updateRound, time.Second)

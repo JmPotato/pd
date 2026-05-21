@@ -51,6 +51,35 @@ const (
 	// outer-tick window.
 	defaultSmoothHeartbeatPacing = false
 
+	// v2.4 (2026-05-20): stagger-burst — round-robin per-store burst windows across
+	// the outer tick. Store i starts its burst at offset (i-1) * outer_tick / StoreCount,
+	// then bursts all its regions tightly (no inner pacing) and sleeps until the next
+	// outer tick. This reproduces real-TiKV behaviour (each store has its own ticker;
+	// 100 stores' tickers stagger naturally) and yields "at any instant only ~8 stores
+	// active" — leaving the other ~92 stores' gRPC handler goroutines parked, which is
+	// the structural prerequisite for idle P → findRunnableGCWorker → lfstack contention
+	// seen in online stepdown. Mutually exclusive with smooth-heartbeat-pacing.
+	defaultStaggerBurst = false
+
+	// v2.5 (2026-05-20): burst-cycle — overlay a wall-clock-phase-aware fraction on
+	// each outer-tick's effective region count, modelling the COLLECTIVE 10-min burst
+	// cycle observed on online cluster 10989049060142230334 (verified via Clinic PromQL
+	// `pd_scheduler_region_heartbeat{type="report", status="ok"}`):
+	//   HIGH segment (60s @ ~80K/s aggregate ingress = 60% of leader_count reported)
+	//   ramp_down (60s linear interp HIGH → LOW)
+	//   LOW segment (420s @ ~40K/s aggregate = 31% of leader_count reported)
+	//   ramp_up (60s linear interp LOW → HIGH)
+	// Total cycle 600s. Online stepdown observed at LOW→HIGH transition wall-clock
+	// where alloc rate spikes 2x and triggers mark assist → 48 P enter findRunnableGC
+	// Worker → lfstack.pop contention → keepAliveWorker starvation.
+	// Requires smooth-heartbeat-pacing=true; mutually exclusive with stagger-burst.
+	defaultBurstCycle              = false
+	defaultBurstCyclePeriodSec     = 600
+	defaultBurstCycleHighSec       = 60
+	defaultBurstCycleRampSec       = 60
+	defaultBurstCycleHighFraction  = 0.60
+	defaultBurstCycleLowFraction   = 0.31
+
 	defaultLogFormat = "text"
 )
 
@@ -140,6 +169,30 @@ type Config struct {
 	// `region-heartbeat-qps = 0` so the outer ticker stays at 60 s and only pacing
 	// distribution changes.
 	SmoothHeartbeatPacing bool `toml:"smooth-heartbeat-pacing" json:"smooth-heartbeat-pacing"`
+
+	// StaggerBurst: when true, the N store-workers each delay their burst start by
+	// (id-1) * outer_tick / StoreCount so that one store fires every outer_tick/N seconds
+	// (e.g. 60s / 100 stores = 600ms). Each worker still bursts its regions tightly once
+	// it starts (no per-region pacing). At any instant only ceil(burst_duration / 600ms)
+	// stores are active; the remaining stores' RegionHeartbeat handler goroutines on PD
+	// are parked, leaving large idle P pools for findRunnableGCWorker during GC mark.
+	// This is the closest structural match to real TiKV behaviour. Cannot combine with
+	// SmoothHeartbeatPacing (Validate enforces this).
+	StaggerBurst bool `toml:"stagger-burst" json:"stagger-burst"`
+
+	// BurstCycle (v2.5, 2026-05-20): overlay a wall-clock-phase-aware fraction on each
+	// outer-tick's effective region count, reproducing the online 10-min collective
+	// burst cycle (see Clinic PromQL on cluster 10989049060142230334). When enabled,
+	// each worker computes (wall_clock % BurstCyclePeriodSec) and applies the matching
+	// phase's report fraction to its region slice before sending. Requires
+	// SmoothHeartbeatPacing=true to spread the (variable) per-tick count uniformly
+	// across the outer-tick window; mutex exclusive with StaggerBurst.
+	BurstCycle             bool    `toml:"burst-cycle" json:"burst-cycle"`
+	BurstCyclePeriodSec    int     `toml:"burst-cycle-period-sec" json:"burst-cycle-period-sec"`
+	BurstCycleHighSec      int     `toml:"burst-cycle-high-sec" json:"burst-cycle-high-sec"`
+	BurstCycleRampSec      int     `toml:"burst-cycle-ramp-sec" json:"burst-cycle-ramp-sec"`
+	BurstCycleHighFraction float64 `toml:"burst-cycle-high-fraction" json:"burst-cycle-high-fraction"`
+	BurstCycleLowFraction  float64 `toml:"burst-cycle-low-fraction" json:"burst-cycle-low-fraction"`
 }
 
 // NewConfig return a set of settings.
@@ -174,6 +227,13 @@ func NewConfig() *Config {
 	fs.IntVar(&cfg.StoreCapacityGiB, "store-capacity-gib", 0, "per-store capacity in GiB; 0 auto-computes from region count")
 	fs.BoolVar(&cfg.BucketsAfterFirstHeartbeatRound, "buckets-after-first-heartbeat-round", defaultBucketsAfterFirstHeartbeat, "gate ReportBuckets workers on first heartbeat round complete (fixes race)")
 	fs.BoolVar(&cfg.SmoothHeartbeatPacing, "smooth-heartbeat-pacing", defaultSmoothHeartbeatPacing, "spread per-store region heartbeats uniformly across the outer-tick window with ±10%% jitter (v2.3 experimental); false = legacy bursty")
+	fs.BoolVar(&cfg.StaggerBurst, "stagger-burst", defaultStaggerBurst, "stagger per-store burst start by (id-1)*outer_tick/StoreCount (v2.4); each store still bursts its regions tightly. Mimics real-TiKV ticker stagger to leave idle P for findRunnableGCWorker. Mutually exclusive with smooth-heartbeat-pacing.")
+	fs.BoolVar(&cfg.BurstCycle, "burst-cycle", defaultBurstCycle, "overlay wall-clock-phase-aware fraction on per-tick region count to reproduce online 10-min collective burst cycle (v2.5). Requires smooth-heartbeat-pacing=true.")
+	fs.IntVar(&cfg.BurstCyclePeriodSec, "burst-cycle-period-sec", defaultBurstCyclePeriodSec, "burst cycle total period in seconds (v2.5; default 600 = online 10 min)")
+	fs.IntVar(&cfg.BurstCycleHighSec, "burst-cycle-high-sec", defaultBurstCycleHighSec, "burst cycle HIGH segment duration in seconds (v2.5; default 60)")
+	fs.IntVar(&cfg.BurstCycleRampSec, "burst-cycle-ramp-sec", defaultBurstCycleRampSec, "burst cycle linear ramp duration each side (v2.5; default 60)")
+	fs.Float64Var(&cfg.BurstCycleHighFraction, "burst-cycle-high-fraction", defaultBurstCycleHighFraction, "fraction of region count to report during HIGH segment (v2.5; default 0.60)")
+	fs.Float64Var(&cfg.BurstCycleLowFraction, "burst-cycle-low-fraction", defaultBurstCycleLowFraction, "fraction of region count to report during LOW segment (v2.5; default 0.31)")
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", "127.0.0.1:9090", "the address to pull metrics")
 
 	return cfg
@@ -274,6 +334,27 @@ func (c *Config) Adjust(meta *toml.MetaData) {
 	if !isDefined(meta, "smooth-heartbeat-pacing") {
 		c.SmoothHeartbeatPacing = defaultSmoothHeartbeatPacing
 	}
+	if !isDefined(meta, "stagger-burst") {
+		c.StaggerBurst = defaultStaggerBurst
+	}
+	if !isDefined(meta, "burst-cycle") {
+		c.BurstCycle = defaultBurstCycle
+	}
+	if !isDefined(meta, "burst-cycle-period-sec") {
+		configutil.AdjustInt(&c.BurstCyclePeriodSec, defaultBurstCyclePeriodSec)
+	}
+	if !isDefined(meta, "burst-cycle-high-sec") {
+		configutil.AdjustInt(&c.BurstCycleHighSec, defaultBurstCycleHighSec)
+	}
+	if !isDefined(meta, "burst-cycle-ramp-sec") {
+		configutil.AdjustInt(&c.BurstCycleRampSec, defaultBurstCycleRampSec)
+	}
+	if !isDefined(meta, "burst-cycle-high-fraction") {
+		configutil.AdjustFloat64(&c.BurstCycleHighFraction, defaultBurstCycleHighFraction)
+	}
+	if !isDefined(meta, "burst-cycle-low-fraction") {
+		configutil.AdjustFloat64(&c.BurstCycleLowFraction, defaultBurstCycleLowFraction)
+	}
 }
 
 func isDefined(meta *toml.MetaData, key string) bool {
@@ -364,6 +445,35 @@ func (c *Config) Validate() error {
 	}
 	if c.HotRegionRatio < 0 || c.HotRegionRatio > 1 {
 		return errors.Errorf("hot-region-ratio must be in [0, 1]")
+	}
+	if c.SmoothHeartbeatPacing && c.StaggerBurst {
+		return errors.Errorf("smooth-heartbeat-pacing and stagger-burst are mutually exclusive")
+	}
+	if c.BurstCycle {
+		if c.StaggerBurst {
+			return errors.Errorf("burst-cycle and stagger-burst are mutually exclusive")
+		}
+		if !c.SmoothHeartbeatPacing {
+			return errors.Errorf("burst-cycle requires smooth-heartbeat-pacing=true so the (variable) per-tick region count is spread uniformly across the outer-tick window")
+		}
+		if c.BurstCyclePeriodSec <= 0 {
+			return errors.Errorf("burst-cycle-period-sec must be positive")
+		}
+		if c.BurstCycleHighSec < 0 || c.BurstCycleRampSec < 0 {
+			return errors.Errorf("burst-cycle-high-sec and burst-cycle-ramp-sec must be non-negative")
+		}
+		if c.BurstCycleHighSec+2*c.BurstCycleRampSec >= c.BurstCyclePeriodSec {
+			return errors.Errorf("burst-cycle-high-sec + 2*burst-cycle-ramp-sec must be less than burst-cycle-period-sec (leaves LOW segment >0)")
+		}
+		if c.BurstCycleHighFraction < 0 || c.BurstCycleHighFraction > 1 {
+			return errors.Errorf("burst-cycle-high-fraction must be in [0, 1]")
+		}
+		if c.BurstCycleLowFraction < 0 || c.BurstCycleLowFraction > 1 {
+			return errors.Errorf("burst-cycle-low-fraction must be in [0, 1]")
+		}
+		if c.BurstCycleLowFraction > c.BurstCycleHighFraction {
+			return errors.Errorf("burst-cycle-low-fraction must be <= burst-cycle-high-fraction")
+		}
 	}
 	if c.StoreCapacityGiB < 0 {
 		return errors.Errorf("store-capacity-gib can not be negative")
