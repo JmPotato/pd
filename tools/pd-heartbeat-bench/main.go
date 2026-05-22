@@ -51,7 +51,6 @@ import (
 	"github.com/tikv/pd/pkg/utils/logutil"
 	"github.com/tikv/pd/tools/pd-heartbeat-bench/config"
 	"github.com/tikv/pd/tools/pd-heartbeat-bench/metrics"
-	"go.etcd.io/etcd/pkg/v3/report"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -149,23 +148,17 @@ func newBucketReporterStatus() *bucketReporterStatus {
 	return &bucketReporterStatus{}
 }
 
+// newClient resolves the current PD leader via resolvePDLeader and returns a
+// pdpb.PDClient bound to it. We previously dialed only the first endpoint of a
+// comma-separated --pd-endpoints, which silently routed writes (Bootstrap /
+// PutStore) to a follower if that happened to be a non-leader — the failures
+// then surfaced as cryptic "not leader" RPC errors at process startup. The
+// per-slot streams open their own leader-aware connections via newStreamSlot;
+// this one-shot cli is consumed only at boot (initClusterID, bootstrap,
+// putStores) so we accept that it may stale on leader transfer afterwards.
 func newClient(ctx context.Context, cfg *config.Config) (pdpb.PDClient, error) {
-	tlsConfig, err := cfg.Security.ToTLSConfig()
-	if err != nil {
-		return nil, err
-	}
-	// v3.1.3: cfg.PDAddr may be comma-separated multi-endpoint. grpcutil
-	// expects single host:port, so use the first; leader-aware streamSlot
-	// rediscovers and rebuilds against the real leader afterwards.
-	addr := cfg.PDAddr
-	if strings.Contains(addr, ",") {
-		addr = strings.TrimSpace(strings.Split(addr, ",")[0])
-	}
-	cc, err := grpcutil.GetClientConn(ctx, addr, tlsConfig)
-	if err != nil {
-		return nil, err
-	}
-	return pdpb.NewPDClient(cc), nil
+	_, _, cli, err := resolvePDLeaderWithRetry(ctx, cfg)
+	return cli, err
 }
 
 func initClusterID(ctx context.Context, cli pdpb.PDClient) {
@@ -521,31 +514,19 @@ func (rs *Regions) update(cfg *config.Config, options *config.Options) {
 	rs.awakenRegions.Store(awakenRegions)
 }
 
-func createHeartbeatStream(ctx context.Context, cfg *config.Config) (pdpb.PDClient, pdpb.PD_RegionHeartbeatClient) {
-	cli, err := newClient(ctx, cfg)
-	if err != nil {
-		log.Fatal("create client error", zap.Error(err))
-	}
-	stream, err := cli.RegionHeartbeat(ctx)
-	if err != nil {
-		log.Fatal("create stream error", zap.Error(err))
-	}
-
-	go func() {
-		// do nothing
-		for {
-			stream.Recv()
-		}
-	}()
-	return cli, stream
-}
-
-// streamSlot (v3.1.3, 2026-05-21) wraps a per-store RegionHeartbeat stream with
+// streamSlot (v3.1.4, 2026-05-21) wraps a per-store RegionHeartbeat stream with
 // **leader-aware** reconnect support. send() and drainRecv() detect a broken
 // stream (PD silently closes after leader transfer); reconnect() rediscovers
 // the current PD leader and rebuilds cli+stream against the new leader endpoint,
 // because raw pdpb.PDClient has no service discovery and would otherwise loop
 // forever connecting to the stale ex-leader.
+//
+// Concurrency model:
+//   - send() and drainRecv() each observe a specific stream pointer; both call
+//     reconnect(observed). reconnect() bails as a no-op if s.stream != observed,
+//     so only the first caller actually rebuilds — the other returns nil.
+//   - kickCh carries a single buffered signal that runStoreWorker consumes to
+//     immediately run a fullResend round on top of the next ticker.Reset().
 type streamSlot struct {
 	storeID uint64
 	cfg     *config.Config
@@ -554,35 +535,70 @@ type streamSlot struct {
 	mu               sync.Mutex
 	cli              pdpb.PDClient
 	cc               *grpc.ClientConn // tracked so we can Close() on rebuild
-	currentEp        string           // host:port of the endpoint cli is bound to
+	currentEp        string           // canonical endpoint URL cli is bound to
 	stream           pdpb.PD_RegionHeartbeatClient
 	fullResendNeeded atomic.Bool
 	reconnects       atomic.Uint64
+
+	// kickCh: reconnect() signals here so the per-store worker runs its
+	// post-reconnect full heartbeat round immediately instead of waiting up
+	// to a full tickInterval (60s by default). Buffered=1 absorbs the case
+	// where multiple reconnects happen before the worker drains it.
+	kickCh chan struct{}
 }
 
-// resolvePDLeader (v3.1.3) discovers the current PD leader endpoint by trying
-// each configured endpoint in turn. Returns (leader_endpoint, leader_cc,
-// leader_cli, nil) on success.
+// GetCli returns the current leader-bound PDClient under the slot mutex. Used
+// by long-running side-channel reporters (ReportMinResolvedTS) so they pick up
+// the new leader's cli after a reconnect, instead of holding a snapshot of the
+// initial cli that goes stale on leader transfer.
+func (s *streamSlot) GetCli() pdpb.PDClient {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cli
+}
+
+// canonicalEndpoint normalises a PD endpoint string so two URLs that point at
+// the same node compare equal regardless of trailing slash / surrounding
+// whitespace. Scheme is preserved (grpcutil.GetClientConn relies on url.Parse
+// returning a non-empty Host, which only works when the scheme is present).
+func canonicalEndpoint(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimRight(s, "/")
+	return s
+}
+
+// resolvePDLeader (v3.1.4, 2026-05-21) discovers the current PD leader by
+// probing each configured --pd-endpoints entry until one returns a leader
+// member. Previously the function stripped scheme off the leader's ClientUrl
+// before dialing, which silently broke grpcutil.GetClientConn — url.Parse
+// rejects bare host:port with `first path segment in URL cannot contain colon`.
+// We now keep the full URL throughout and compare endpoints via
+// canonicalEndpoint.
+//
+// Returns (leader_endpoint, leader_cc, leader_cli, nil) on success. The caller
+// owns the returned *grpc.ClientConn and must Close() it when the cli is
+// retired.
 func resolvePDLeader(ctx context.Context, cfg *config.Config) (string, *grpc.ClientConn, pdpb.PDClient, error) {
 	tlsConfig, err := cfg.Security.ToTLSConfig()
 	if err != nil {
 		return "", nil, nil, err
 	}
-	eps := strings.Split(cfg.PDAddr, ",")
+	eps := cfg.SplitEndpoints()
+	if len(eps) == 0 {
+		return "", nil, nil, stderrors.New("no PD endpoints configured")
+	}
 	var lastErr error
 	for _, ep := range eps {
-		ep = strings.TrimSpace(ep)
-		if ep == "" {
-			continue
-		}
 		cc, err := grpcutil.GetClientConn(ctx, ep, tlsConfig)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		cli := pdpb.NewPDClient(cc)
-		resp, err := cli.GetMembers(ctx, &pdpb.GetMembersRequest{})
-		if err != nil || resp == nil || resp.Leader == nil || len(resp.Leader.ClientUrls) == 0 {
+		mctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		resp, err := cli.GetMembers(mctx, &pdpb.GetMembersRequest{})
+		cancel()
+		if err != nil || resp == nil || resp.GetLeader() == nil || len(resp.GetLeader().GetClientUrls()) == 0 {
 			cc.Close()
 			if err == nil {
 				err = stderrors.New("no leader info in GetMembers response")
@@ -590,19 +606,18 @@ func resolvePDLeader(ctx context.Context, cfg *config.Config) (string, *grpc.Cli
 			lastErr = err
 			continue
 		}
-		leaderURL := resp.Leader.ClientUrls[0]
-		leaderEp := strings.TrimPrefix(strings.TrimPrefix(leaderURL, "https://"), "http://")
-		if leaderEp == ep {
-			return ep, cc, cli, nil
+		leaderURL := canonicalEndpoint(resp.GetLeader().GetClientUrls()[0])
+		if canonicalEndpoint(ep) == leaderURL {
+			return leaderURL, cc, cli, nil
 		}
-		// Reached a follower; connect directly to leader.
+		// Reached a peer that knows a different leader; dial leader directly.
 		cc.Close()
-		leaderCc, err := grpcutil.GetClientConn(ctx, leaderEp, tlsConfig)
+		leaderCc, err := grpcutil.GetClientConn(ctx, leaderURL, tlsConfig)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		return leaderEp, leaderCc, pdpb.NewPDClient(leaderCc), nil
+		return leaderURL, leaderCc, pdpb.NewPDClient(leaderCc), nil
 	}
 	if lastErr == nil {
 		lastErr = stderrors.New("no PD endpoint reachable")
@@ -610,50 +625,105 @@ func resolvePDLeader(ctx context.Context, cfg *config.Config) (string, *grpc.Cli
 	return "", nil, nil, lastErr
 }
 
+// resolvePDLeaderWithRetry wraps resolvePDLeader in a 1s retry loop until ctx
+// is cancelled. Used at boot (newClient, newStreamSlot) where a single
+// transient PD blip should not kill the whole bench.
+func resolvePDLeaderWithRetry(ctx context.Context, cfg *config.Config) (string, *grpc.ClientConn, pdpb.PDClient, error) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		ep, cc, cli, err := resolvePDLeader(ctx, cfg)
+		if err == nil {
+			return ep, cc, cli, nil
+		}
+		lastErr = err
+		log.Warn("resolve PD leader failed; retrying in 1s", zap.Error(err))
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return "", nil, nil, lastErr
+		}
+	}
+}
+
+// newStreamSlot constructs a streamSlot, retrying leader resolution + initial
+// stream creation on transient failures. v3.1.3 used log.Fatal here, which
+// turned every startup-time PD blip into a bench-wide crash; we now mirror
+// initClusterID's 1s retry loop with an upper bound so a permanently-broken
+// config still fails fast.
 func newStreamSlot(ctx context.Context, cfg *config.Config, storeID uint64) *streamSlot {
-	ep, cc, cli, err := resolvePDLeader(ctx, cfg)
-	if err != nil {
-		log.Fatal("resolve PD leader error", zap.Uint64("store-id", storeID), zap.Error(err))
+	const maxAttempts = 60 // ≈1 minute of patience
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var (
+		ep     string
+		cc     *grpc.ClientConn
+		cli    pdpb.PDClient
+		stream pdpb.PD_RegionHeartbeatClient
+		err    error
+	)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ep, cc, cli, err = resolvePDLeader(ctx, cfg)
+		if err == nil {
+			stream, err = cli.RegionHeartbeat(ctx)
+			if err == nil {
+				break
+			}
+			cc.Close()
+			cc = nil
+		}
+		log.Warn("newStreamSlot setup failed; retrying in 1s",
+			zap.Uint64("store-id", storeID), zap.Int("attempt", attempt), zap.Error(err))
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			log.Fatal("newStreamSlot ctx cancelled",
+				zap.Uint64("store-id", storeID), zap.Error(ctx.Err()))
+		}
 	}
-	stream, err := cli.RegionHeartbeat(ctx)
 	if err != nil {
-		log.Fatal("create stream error", zap.Uint64("store-id", storeID), zap.Error(err))
+		log.Fatal("newStreamSlot exhausted retries",
+			zap.Uint64("store-id", storeID), zap.Int("max-attempts", maxAttempts), zap.Error(err))
 	}
-	s := &streamSlot{storeID: storeID, cfg: cfg, ctx: ctx, cli: cli, cc: cc, currentEp: ep, stream: stream}
+	s := &streamSlot{
+		storeID:   storeID,
+		cfg:       cfg,
+		ctx:       ctx,
+		cli:       cli,
+		cc:        cc,
+		currentEp: ep,
+		stream:    stream,
+		kickCh:    make(chan struct{}, 1),
+	}
 	go s.drainRecv(stream)
 	return s
 }
 
-// drainRecv consumes Recv() responses until the stream errors out. PD closes
-// the stream silently on leader transfer (no error on the client send-side
-// because the local buffer keeps accepting writes), so we MUST use Recv() as
-// the authoritative liveness signal. v3.1.3: add 200-500ms randomised backoff
-// before triggering reconnect to avoid hot loop when a freshly-built stream
-// EOFs immediately (this happens when raw cli is bound to ex-leader; reconnect
-// will rediscover leader and rebuild cli).
+// drainRecv consumes Recv() responses until the stream errors. PD closes the
+// stream silently on leader transfer (the client-side Send buffer keeps
+// accepting writes for a while), so Recv() is the authoritative liveness
+// signal. v3.1.4: pointer-equality is the sole reconnect guard — drainRecv
+// observes the exact stream it was started for and asks reconnect to rebuild
+// only that stream; a concurrent send()-triggered reconnect for the same
+// stream wins the race and drainRecv's reconnect call becomes a no-op.
 func (s *streamSlot) drainRecv(stream pdpb.PD_RegionHeartbeatClient) {
 	for {
 		_, err := stream.Recv()
 		if err == nil {
 			continue
 		}
-		s.mu.Lock()
-		stillActive := s.stream == stream
-		s.mu.Unlock()
-		if !stillActive {
-			return
-		}
-		// Randomised backoff: prevents 100 stores from synchronously reconnect-
-		// storming PD right after a leader transfer.
-		time.Sleep(time.Duration(200+rand.Intn(300)) * time.Millisecond)
-		s.mu.Lock()
-		stillActive = s.stream == stream
-		s.mu.Unlock()
-		if !stillActive {
+		// Randomised backoff: prevents 100 stores from synchronously
+		// reconnect-storming PD right after a leader transfer. We sleep
+		// before reconnect so the send() path (if it's also retrying) has
+		// time to be the single caller that does the rebuild.
+		select {
+		case <-time.After(time.Duration(200+rand.Intn(300)) * time.Millisecond):
+		case <-s.ctx.Done():
 			return
 		}
 		if s.cfg.AutoReconnect {
-			if rerr := s.reconnect(); rerr != nil {
+			if rerr := s.reconnect(stream); rerr != nil {
 				heartbeatStreamErrors.WithLabelValues(strconv.FormatUint(s.storeID, 10), "drainrecv_reconnect_failed").Inc()
 				log.Warn("drainRecv reconnect failed", zap.Uint64("store-id", s.storeID), zap.Error(rerr))
 			}
@@ -662,48 +732,54 @@ func (s *streamSlot) drainRecv(stream pdpb.PD_RegionHeartbeatClient) {
 	}
 }
 
-// send attempts stream.Send(req); on error, if AutoReconnect is enabled it
-// re-acquires the stream and retries once. Caller-visible error means
-// reconnect itself failed (rare) or retry-send failed.
+// send transmits one heartbeat. On send error it triggers reconnect (which
+// pointer-equality-guards against duplicate rebuilds) and returns the original
+// send error — the caller (runOneRound) breaks out of the current round so the
+// next round runs as a full resend on the new stream. We no longer transparently
+// retry inside send: the v3.1.3 internal retry mixed "this single send is OK"
+// with "stream has been recovered" semantics, which made runOneRound continue
+// streaming the steady-state subset on the new leader instead of aborting and
+// running a faithful full resend on the next round.
 func (s *streamSlot) send(req *pdpb.RegionHeartbeatRequest) error {
 	s.mu.Lock()
-	err := s.stream.Send(req)
+	observed := s.stream
+	err := observed.Send(req)
 	s.mu.Unlock()
 	if err == nil {
 		return nil
 	}
-	storeLabel := strconv.FormatUint(s.storeID, 10)
-	heartbeatStreamErrors.WithLabelValues(storeLabel, "send_initial").Inc()
-	if !s.cfg.AutoReconnect {
-		return err
-	}
-	log.Warn("region heartbeat stream send error, attempting reconnect",
-		zap.Uint64("store-id", s.storeID), zap.Error(err))
-	if rerr := s.reconnect(); rerr != nil {
-		heartbeatStreamErrors.WithLabelValues(storeLabel, "reconnect_failed").Inc()
-		return rerr
-	}
-	s.mu.Lock()
-	err = s.stream.Send(req)
-	s.mu.Unlock()
-	if err != nil {
-		heartbeatStreamErrors.WithLabelValues(storeLabel, "send_retry").Inc()
+	heartbeatStreamErrors.WithLabelValues(strconv.FormatUint(s.storeID, 10), "send").Inc()
+	if s.cfg.AutoReconnect {
+		log.Warn("region heartbeat send error; triggering reconnect",
+			zap.Uint64("store-id", s.storeID), zap.Error(err))
+		if rerr := s.reconnect(observed); rerr != nil {
+			heartbeatStreamErrors.WithLabelValues(strconv.FormatUint(s.storeID, 10), "reconnect_failed").Inc()
+			log.Warn("send-triggered reconnect failed", zap.Uint64("store-id", s.storeID), zap.Error(rerr))
+		}
 	}
 	return err
 }
 
-func (s *streamSlot) reconnect() error {
+// reconnect rebuilds the per-slot RegionHeartbeat stream, re-resolving the PD
+// leader if it has moved. The observed parameter is the stream pointer the
+// caller saw an error on; if s.stream has already been advanced past observed
+// (meaning another goroutine — typically the other of send/drainRecv — already
+// reconnected), this call is a no-op. This is the v3.1.4 pointer-equality
+// guard that replaces the v3.1.3 unconditional rebuild, which during a leader
+// transfer ended up tearing down freshly-built streams to make a 3rd one.
+func (s *streamSlot) reconnect(observed pdpb.PD_RegionHeartbeatClient) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stream != observed {
+		// Another goroutine already rebuilt past this point.
+		return nil
+	}
 	_ = s.stream.CloseSend()
-	// v3.1.3: rediscover leader and rebuild cli if it moved. Without this, raw
-	// pdpb.PDClient stays bound to the ex-leader endpoint forever and every
-	// new stream EOFs instantly. resolvePDLeader probes each configured
-	// endpoint until one returns leader info, then connects directly to leader.
 	newEp, newCc, newCli, err := resolvePDLeader(s.ctx, s.cfg)
 	if err != nil {
-		// Fall back to existing cli — better than nothing.
-		log.Warn("resolvePDLeader failed during reconnect, retrying on existing cli",
+		// Fall back to existing cli — better than nothing. The next round's
+		// send error will retrigger this path.
+		log.Warn("resolvePDLeader failed during reconnect; retrying on existing cli",
 			zap.Uint64("store-id", s.storeID), zap.Error(err))
 	} else if newEp != s.currentEp {
 		if s.cc != nil {
@@ -727,6 +803,13 @@ func (s *streamSlot) reconnect() error {
 	heartbeatStreamReconnects.WithLabelValues(strconv.FormatUint(s.storeID, 10)).Inc()
 	if s.cfg.FullResendOnReconnect {
 		s.fullResendNeeded.Store(true)
+		// Signal the worker so it runs the post-reconnect round immediately
+		// instead of waiting up to a full tickInterval (real TiKV bursts
+		// immediately on stream re-establishment, not at the next tick).
+		select {
+		case s.kickCh <- struct{}{}:
+		default:
+		}
 	}
 	go s.drainRecv(newStream)
 	log.Info("region heartbeat stream reconnected",
@@ -748,12 +831,13 @@ type storeRoundStat struct {
 	fullResend bool
 }
 
-// runStoreWorker (v3.1) replaces the global ticker + wg.Wait model. Each store
-// has its own ticker, started after a phase offset, so PD sees a continuous
-// stream of heartbeats from a rolling subset of stores instead of cluster-wide
-// synchronized rounds. Sends FullResend (= ignore burst-cycle fraction + skip
-// pacing, burst all regions) on the round immediately following a stream
-// reconnect.
+// runStoreWorker (v3.1.4) drives one store's heartbeat stream. Each store has
+// its own ticker, started after a phase offset so PD sees a continuous arrival
+// pattern instead of cluster-wide synchronized rounds. On post-reconnect kick
+// (slot.kickCh) the worker runs an immediate round AND resets its ticker, so
+// the next steady-state round is one full tickInterval after the burst —
+// mirroring real TiKV which fires a full heartbeat the instant the new PD
+// stream is ready, then resumes its own regular schedule.
 func runStoreWorker(
 	ctx context.Context,
 	cfg *config.Config,
@@ -783,12 +867,33 @@ func runStoreWorker(
 		select {
 		case <-ticker.C:
 			runOneRound(ctx, cfg, rs, slot, storeID, tickInterval, statsCh)
+		case <-slot.kickCh:
+			// Reconnect just succeeded — run the full-resend round NOW and
+			// re-phase the ticker so the next steady round is one tick away.
+			runOneRound(ctx, cfg, rs, slot, storeID, tickInterval, statsCh)
+			ticker.Reset(tickInterval)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
+// runOneRound emits one round's worth of region heartbeats. On fullResend
+// (set by reconnect → fullResendNeeded), this faithfully simulates real TiKV
+// behaviour after PD leader switch: send a heartbeat for EVERY region this
+// store leads, bursting them with no per-region pacing and bypassing the
+// steady-state burst-cycle fraction. Steady-state rounds keep their usual
+// envelope (report-ratio subset, burst-cycle fraction, optional smooth
+// pacing).
+//
+// v3.1.4 (2026-05-21): full-resend semantics changed from "trim by burst-cycle"
+// to "all leader-owned regions". The old behaviour calibrated to a ~44k
+// per-store-per-min target derived from steady-state online observation, but
+// the bench's stated purpose (the user-prompt phrasing was 全量上报心跳) is to
+// reproduce the transient post-transfer burst, which on real TiKV bypasses
+// any rate-shaping — it pushes the full leader set as fast as the stream
+// will accept it. See docs/big-pd-pressure/heartbeat-bench-reconnect-review.md
+// §full-resend semantics.
 func runOneRound(
 	ctx context.Context,
 	cfg *config.Config,
@@ -800,12 +905,23 @@ func runOneRound(
 ) {
 	fullResend := slot.fullResendNeeded.CompareAndSwap(true, false)
 
-	var regions, toUpdate []*pdpb.RegionHeartbeatRequest
-	updatedRegions := rs.awakenRegions.Load()
-	if updatedRegions == nil {
+	// Region source selection:
+	//   fullResend → rs.regions (ALL regions; mirrors TiKV post-reconnect)
+	//   steady     → rs.awakenRegions (the report-ratio subset chosen by
+	//                runClusterUpdater.update())
+	var (
+		regions  []*pdpb.RegionHeartbeatRequest
+		toUpdate []*pdpb.RegionHeartbeatRequest
+	)
+	if fullResend {
 		toUpdate = rs.regions
 	} else {
-		toUpdate = updatedRegions.([]*pdpb.RegionHeartbeatRequest)
+		updatedRegions := rs.awakenRegions.Load()
+		if updatedRegions == nil {
+			toUpdate = rs.regions
+		} else {
+			toUpdate = updatedRegions.([]*pdpb.RegionHeartbeatRequest)
+		}
 	}
 	for _, region := range toUpdate {
 		if region.Leader.StoreId == storeID {
@@ -813,33 +929,25 @@ func runOneRound(
 		}
 	}
 
-	// v3.1.1 (2026-05-21): burst-cycle fraction is ALWAYS applied, even on
-	// FullResend. Real TiKV after PD reconnect bursts its currently-owned region
-	// set, not "all regions ever known", so the active-region fraction modelled
-	// by burst-cycle is still the right population to send. Skipping fraction
-	// inflated per-store ops/min to ~109k (full 81595 regions/min) vs online
-	// peak of ~68k — corrected to ~44k = 81595 × 0.54 fraction here.
-	if cfg.BurstCycle && len(regions) > 0 {
-		fraction := computeBurstCycleFraction(cfg, time.Now())
-		effective := int(float64(len(regions)) * fraction)
-		if effective < 1 {
-			effective = 1
-		}
-		if effective < len(regions) {
-			startOff := 0
-			if span := len(regions) - effective; span > 0 {
-				startOff = rand.Intn(span + 1)
+	// Steady-state envelope shaping (burst-cycle + per-region pacing). Skipped
+	// on fullResend so the post-reconnect round bursts at line rate.
+	perRegionDelay := time.Duration(0)
+	if !fullResend {
+		if cfg.BurstCycle && len(regions) > 0 {
+			fraction := computeBurstCycleFraction(cfg, time.Now())
+			effective := int(float64(len(regions)) * fraction)
+			if effective < 1 {
+				effective = 1
 			}
-			regions = regions[startOff : startOff+effective]
+			if effective < len(regions) {
+				startOff := 0
+				if span := len(regions) - effective; span > 0 {
+					startOff = rand.Intn(span + 1)
+				}
+				regions = regions[startOff : startOff+effective]
+			}
 		}
-	}
-
-	perRegionDelay := computeSmoothPaceDelay(cfg, paceInterval, len(regions))
-	if fullResend {
-		// Full resend on reconnect: skip inter-region pacing so the per-store
-		// burst window matches real TiKV reconnect behaviour. Fraction stays so
-		// the burst contains the same number of regions a normal round would.
-		perRegionDelay = 0
+		perRegionDelay = computeSmoothPaceDelay(cfg, paceInterval, len(regions))
 	}
 
 	start := time.Now()
@@ -848,7 +956,10 @@ func runOneRound(
 	for i, region := range regions {
 		if err := slot.send(region); err != nil {
 			errs++
-			log.Warn("region heartbeat send failed after reconnect",
+			// send() already triggered reconnect (pointer-equality guarded).
+			// End this round; the kickCh path or the next ticker fire will
+			// run a full-resend round on the new stream.
+			log.Warn("region heartbeat send failed; ending round",
 				zap.Uint64("store-id", storeID), zap.Error(err))
 			break
 		}
@@ -1031,89 +1142,13 @@ func paceJitter(perRegionDelay time.Duration) time.Duration {
 	return perRegionDelay + time.Duration(j)
 }
 
-func (rs *Regions) handleRegionHeartbeat(ctx context.Context, cfg *config.Config, wg *sync.WaitGroup, stream pdpb.PD_RegionHeartbeatClient, storeID uint64, rep report.Report, paceInterval time.Duration) {
-	defer wg.Done()
-	var regions, toUpdate []*pdpb.RegionHeartbeatRequest
-	updatedRegions := rs.awakenRegions.Load()
-	if updatedRegions == nil {
-		toUpdate = rs.regions
-	} else {
-		toUpdate = updatedRegions.([]*pdpb.RegionHeartbeatRequest)
-	}
-	for _, region := range toUpdate {
-		if region.Leader.StoreId != storeID {
-			continue
-		}
-		regions = append(regions, region)
-	}
-
-	// v2.5 (2026-05-20): collective burst cycle — truncate the per-tick region slice
-	// to a wall-clock-phase-aware fraction so PD ingress rate follows the online
-	// 10-min HIGH/LOW cycle. Random starting offset keeps every region eventually
-	// reported (no permanent stale set). When burst-cycle is disabled, fraction=1.0
-	// and this block is a no-op.
-	if cfg.BurstCycle && len(regions) > 0 {
-		fraction := computeBurstCycleFraction(cfg, time.Now())
-		effective := int(float64(len(regions)) * fraction)
-		if effective < 1 {
-			effective = 1
-		}
-		if effective < len(regions) {
-			startOff := 0
-			if span := len(regions) - effective; span > 0 {
-				startOff = rand.Intn(span + 1)
-			}
-			regions = regions[startOff : startOff+effective]
-		}
-	}
-
-	// v2.3 (2026-05-20): per-region pacing. Zero delay = bursty (legacy) mode.
-	perRegionDelay := computeSmoothPaceDelay(cfg, paceInterval, len(regions))
-
-	start := time.Now()
-	var err error
-	lastIdx := len(regions) - 1
-	for i, region := range regions {
-		err = stream.Send(region)
-		rep.Results() <- report.Result{Start: start, End: time.Now(), Err: err}
-		if err == io.EOF {
-			log.Error("receive eof error", zap.Uint64("store-id", storeID), zap.Error(err))
-			err := stream.CloseSend()
-			if err != nil {
-				log.Error("fail to close stream", zap.Uint64("store-id", storeID), zap.Error(err))
-			}
-			return
-		}
-		if err != nil {
-			log.Error("send result error", zap.Uint64("store-id", storeID), zap.Error(err))
-			return
-		}
-		// Pace remaining sends; no point sleeping after the last one.
-		if perRegionDelay > 0 && i < lastIdx {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(paceJitter(perRegionDelay)):
-			}
-		}
-	}
-	log.Info("store finish one round region heartbeat", zap.Uint64("store-id", storeID), zap.Duration("cost-time", time.Since(start)), zap.Int("reported-region-count", len(regions)), zap.Duration("per-region-delay", perRegionDelay))
-}
-
 // Stores contains store stats with lock.
 type Stores struct {
 	stat     []atomic.Value
 	capacity uint64 // v2.1 (2026-05-20): configurable per-store capacity
 }
 
-func newStores(storeCount int) *Stores {
-	return &Stores{
-		stat:     make([]atomic.Value, storeCount+1),
-		capacity: legacyCapacity,
-	}
-}
-
-// v2.1 (2026-05-20): factory that respects the configured (or auto-computed) per-store
+// newStoresWithCapacity respects the configured (or auto-computed) per-store
 // capacity so `store.Available -= region.ApproximateSize` doesn't underflow when
 // RegionApproximateSizeMiB pushes per-store live data past the legacy 4 TiB cap.
 func newStoresWithCapacity(storeCount int, capacityBytes uint64) *Stores {
@@ -1403,10 +1438,63 @@ func runReportBucketsStream(
 	}
 }
 
-func newReportBucketsStreamFactory(cli pdpb.PDClient) reportBucketsStreamFactory {
-	return func(ctx context.Context) (reportBucketsClient, error) {
-		return cli.ReportBuckets(ctx)
+// newLeaderAwareReportBucketsStreamFactory (v3.1.4) returns a factory and a
+// closer. The factory re-resolves the PD leader (with a 1s coalescing window
+// so a thundering herd of N workers restarting in lockstep after a leader
+// transfer issues at most one GetMembers per second). All bucket workers
+// share a single leader-bound *grpc.ClientConn that this returns; on actual
+// leader move the old conn is Close()d and replaced.
+//
+// The v3.1.3 factory was bound to the boot-time `cli` and never followed
+// leader transfers, so once leader moved every ReportBuckets stream errored
+// indefinitely.
+func newLeaderAwareReportBucketsStreamFactory(cfg *config.Config) (reportBucketsStreamFactory, func()) {
+	var (
+		mu          sync.Mutex
+		cc          *grpc.ClientConn
+		cli         pdpb.PDClient
+		ep          string
+		lastResolve time.Time
+	)
+	refresh := func(ctx context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if cli != nil && time.Since(lastResolve) < time.Second {
+			return nil
+		}
+		newEp, newCc, newCli, err := resolvePDLeader(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		if ep != newEp {
+			if cc != nil {
+				_ = cc.Close()
+			}
+			cc, cli, ep = newCc, newCli, newEp
+		} else {
+			_ = newCc.Close()
+		}
+		lastResolve = time.Now()
+		return nil
 	}
+	factory := func(ctx context.Context) (reportBucketsClient, error) {
+		if err := refresh(ctx); err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		c := cli
+		mu.Unlock()
+		return c.ReportBuckets(ctx)
+	}
+	closer := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if cc != nil {
+			_ = cc.Close()
+			cc = nil
+		}
+	}
+	return factory, closer
 }
 
 func main() {
@@ -1470,18 +1558,25 @@ func main() {
 	bootstrap(ctx, cli)
 	putStores(ctx, cfg, cli, stores)
 	log.Info("finish put stores")
-	httpCli := pdHttp.NewClient("tools-heartbeat-bench", []string{cfg.PDAddr}, pdHttp.WithTLSConfig(loadTLSConfig(cfg)))
+	// v3.1.4 (2026-05-21): pdHttp.NewClient takes a []string of endpoints which
+	// it feeds to PD's ServiceDiscovery — that machinery follows leader
+	// transfers automatically. Previously we passed []string{cfg.PDAddr} so
+	// the comma-joined multi-endpoint string was treated as a single weird
+	// endpoint; ServiceDiscovery's leader following degraded to whatever the
+	// first character of the string resolved to.
+	httpCli := pdHttp.NewClient("tools-heartbeat-bench", cfg.SplitEndpoints(), pdHttp.WithTLSConfig(loadTLSConfig(cfg)))
 	go deleteOperators(ctx, httpCli)
 
-	// v3.1 (2026-05-21): per-store stream slots with auto-reconnect. clis is
-	// retained as a separate map because runMinResolvedTSReporter and the
-	// bucket worker factory still consume bare PDClients.
+	// v3.1.4 (2026-05-21): per-store stream slots with auto-reconnect. The
+	// v3.1 `clis := slots[id].cli` snapshot was removed — that map captured
+	// the initial leader cli at slot construction and never updated on
+	// reconnect, so ReportMinResolvedTS continued targeting the ex-leader
+	// after a transfer. Long-lived side channels now dereference
+	// slots[id].GetCli() at call time.
 	slots := make(map[uint64]*streamSlot, cfg.StoreCount)
-	clis := make(map[uint64]pdpb.PDClient, cfg.StoreCount)
 	for i := 1; i <= cfg.StoreCount; i++ {
 		id := uint64(i)
 		slots[id] = newStreamSlot(ctx, cfg, id)
-		clis[id] = slots[id].cli
 	}
 	header := &pdpb.RequestHeader{
 		ClusterId: clusterID,
@@ -1516,7 +1611,9 @@ func main() {
 		log.Info("full-resend-on-reconnect enabled (TiKV-style burst after reconnect, v3.1)")
 	}
 	runMinResolvedTSReporter(ctx, cfg.StoreCount, intervalForAggregateQPS(cfg.ReportMinResolvedTSQPS, cfg.StoreCount, time.Second), func(ctx context.Context, id uint64) error {
-		cli := clis[id]
+		// v3.1.4: dereference the slot's current leader cli at call time so
+		// ReportMinResolvedTS follows leader transfers.
+		cli := slots[id].GetCli()
 		_, err := cli.ReportMinResolvedTS(ctx, &pdpb.ReportMinResolvedTsRequest{
 			Header:        header,
 			StoreId:       id,
@@ -1529,13 +1626,15 @@ func main() {
 	if cfg.BucketsAfterFirstHeartbeatRound {
 		bucketGate = make(chan struct{})
 	}
+	bucketFactory, bucketFactoryCloser := newLeaderAwareReportBucketsStreamFactory(cfg)
+	defer bucketFactoryCloser()
 	startReportBucketsWorkers(
 		ctx,
 		cfg.ReportBucketsStreams,
 		time.Duration(cfg.ReportBucketsIntervalMS)*time.Millisecond,
 		regions,
 		bucketStatus,
-		newReportBucketsStreamFactory(cli),
+		bucketFactory,
 		bucketGate,
 	)
 	metrics.InitMetric2Collect(cfg.MetricsAddr)
@@ -1600,43 +1699,6 @@ func deleteOperators(ctx context.Context, httpCli pdHttp.Client) {
 			}
 		}
 	}
-}
-
-func newReport(cfg *config.Config) report.Report {
-	p := "%4.4f"
-	if cfg.Sample {
-		return report.NewReportSample(p)
-	}
-	return report.NewReport(p)
-}
-
-func (rs *Regions) result(regionCount int, sec float64) {
-	if rs.updateRound == 0 {
-		// There was no difference in the first round
-		return
-	}
-
-	updated := make(map[int]struct{})
-	for _, i := range rs.updateLeader {
-		updated[i] = struct{}{}
-	}
-	for _, i := range rs.updateEpoch {
-		updated[i] = struct{}{}
-	}
-	for _, i := range rs.updateSpace {
-		updated[i] = struct{}{}
-	}
-	for _, i := range rs.updateFlow {
-		updated[i] = struct{}{}
-	}
-	inactiveCount := regionCount - len(updated)
-
-	log.Info("update speed of each category", zap.String("rps", fmt.Sprintf("%.4f", float64(regionCount)/sec)),
-		zap.String("save-tree", fmt.Sprintf("%.4f", float64(len(rs.updateLeader))/sec)),
-		zap.String("save-kv", fmt.Sprintf("%.4f", float64(len(rs.updateEpoch))/sec)),
-		zap.String("save-space", fmt.Sprintf("%.4f", float64(len(rs.updateSpace))/sec)),
-		zap.String("save-flow", fmt.Sprintf("%.4f", float64(len(rs.updateFlow))/sec)),
-		zap.String("skip", fmt.Sprintf("%.4f", float64(inactiveCount)/sec)))
 }
 
 func runHTTPServer(cfg *config.Config, options *config.Options) {

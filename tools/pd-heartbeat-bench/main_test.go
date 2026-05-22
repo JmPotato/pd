@@ -18,15 +18,18 @@ import (
 	"context"
 	stderrors "errors"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/pdpb"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/pd/tools/pd-heartbeat-bench/config"
-	"go.etcd.io/etcd/pkg/v3/report"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -295,6 +298,329 @@ func TestExpectedReportBucketsShutdownNeedsCanceledContext(t *testing.T) {
 	require.False(t, isExpectedReportBucketsShutdown(ctx, stderrors.New("send failed")))
 }
 
+// v3.1.4 (2026-05-21): tests for service discovery + leader-aware reconnect.
+
+// mockPDServer is a minimal pdpb.PDServer used to drive resolvePDLeader and
+// streamSlot tests without spinning up a real PD. It supports configurable
+// GetMembers responses (so we can move the "leader" between mocks) and an
+// optional RegionHeartbeat handler that the test can install to assert
+// stream-level interactions.
+type mockPDServer struct {
+	pdpb.UnimplementedPDServer
+	mu         sync.Mutex
+	members    *pdpb.GetMembersResponse
+	membersErr error
+
+	heartbeatRecv func(*pdpb.RegionHeartbeatRequest)
+	closeStreams  atomic.Bool
+}
+
+func (m *mockPDServer) setMembers(resp *pdpb.GetMembersResponse, err error) {
+	m.mu.Lock()
+	m.members = resp
+	m.membersErr = err
+	m.mu.Unlock()
+}
+
+func (m *mockPDServer) GetMembers(ctx context.Context, req *pdpb.GetMembersRequest) (*pdpb.GetMembersResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.membersErr != nil {
+		return nil, m.membersErr
+	}
+	return m.members, nil
+}
+
+func (m *mockPDServer) RegionHeartbeat(stream pdpb.PD_RegionHeartbeatServer) error {
+	for {
+		if m.closeStreams.Load() {
+			return io.EOF
+		}
+		req, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		if cb := m.heartbeatRecv; cb != nil {
+			cb(req)
+		}
+	}
+}
+
+func startMockPD(t *testing.T) (*mockPDServer, string, func()) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := &mockPDServer{}
+	gs := grpc.NewServer()
+	pdpb.RegisterPDServer(gs, srv)
+	go func() { _ = gs.Serve(lis) }()
+	stop := func() {
+		gs.Stop()
+		lis.Close()
+	}
+	return srv, "http://" + lis.Addr().String(), stop
+}
+
+func TestResolvePDLeaderFirstEndpointIsLeader(t *testing.T) {
+	srv, addr, stop := startMockPD(t)
+	defer stop()
+	srv.setMembers(&pdpb.GetMembersResponse{
+		Header: &pdpb.ResponseHeader{ClusterId: 1},
+		Leader: &pdpb.Member{ClientUrls: []string{addr}},
+	}, nil)
+
+	cfg := &config.Config{PDAddr: addr}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ep, cc, cli, err := resolvePDLeader(ctx, cfg)
+	require.NoError(t, err)
+	require.Equal(t, addr, ep, "leaderURL with scheme must round-trip through canonicalEndpoint")
+	require.NotNil(t, cli)
+	require.NotNil(t, cc)
+	cc.Close()
+}
+
+func TestResolvePDLeaderFollowerRedirectsToLeader(t *testing.T) {
+	// 2 mock PDs; first is a follower that knows the second is leader.
+	follower, followerAddr, stopF := startMockPD(t)
+	defer stopF()
+	leader, leaderAddr, stopL := startMockPD(t)
+	defer stopL()
+
+	follower.setMembers(&pdpb.GetMembersResponse{
+		Header: &pdpb.ResponseHeader{ClusterId: 1},
+		Leader: &pdpb.Member{ClientUrls: []string{leaderAddr}},
+	}, nil)
+	leader.setMembers(&pdpb.GetMembersResponse{
+		Header: &pdpb.ResponseHeader{ClusterId: 1},
+		Leader: &pdpb.Member{ClientUrls: []string{leaderAddr}},
+	}, nil)
+
+	cfg := &config.Config{PDAddr: followerAddr + "," + leaderAddr}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ep, cc, cli, err := resolvePDLeader(ctx, cfg)
+	require.NoError(t, err)
+	require.Equal(t, leaderAddr, ep, "must redirect to leader endpoint, preserving scheme")
+	require.NotNil(t, cli)
+	cc.Close()
+}
+
+func TestResolvePDLeaderFallsThroughOnFirstEndpointDown(t *testing.T) {
+	// First endpoint dead, second is leader.
+	leader, leaderAddr, stopL := startMockPD(t)
+	defer stopL()
+	leader.setMembers(&pdpb.GetMembersResponse{
+		Header: &pdpb.ResponseHeader{ClusterId: 1},
+		Leader: &pdpb.Member{ClientUrls: []string{leaderAddr}},
+	}, nil)
+
+	// Pick an almost-certainly-unused port for the dead endpoint.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	deadAddr := "http://" + lis.Addr().String()
+	lis.Close() // free the port — gRPC dial will fail to connect / GetMembers will time out
+
+	cfg := &config.Config{PDAddr: deadAddr + "," + leaderAddr}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	ep, cc, cli, err := resolvePDLeader(ctx, cfg)
+	require.NoError(t, err)
+	require.Equal(t, leaderAddr, ep)
+	require.NotNil(t, cli)
+	cc.Close()
+}
+
+func TestResolvePDLeaderReturnsErrWhenAllDown(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	deadAddr := "http://" + lis.Addr().String()
+	lis.Close()
+
+	cfg := &config.Config{PDAddr: deadAddr}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	_, _, _, err = resolvePDLeader(ctx, cfg)
+	require.Error(t, err)
+}
+
+func TestCanonicalEndpoint(t *testing.T) {
+	require.Equal(t, "http://127.0.0.1:2379", canonicalEndpoint("http://127.0.0.1:2379"))
+	require.Equal(t, "http://127.0.0.1:2379", canonicalEndpoint("http://127.0.0.1:2379/"))
+	require.Equal(t, "http://127.0.0.1:2379", canonicalEndpoint("  http://127.0.0.1:2379  "))
+	require.Equal(t, "https://x.y.z:2379", canonicalEndpoint("https://x.y.z:2379"))
+}
+
+// runOneRound full-resend semantics: when fullResendNeeded is true,
+// (a) the whole leader-owned region set is sent (no report-ratio subset, no
+// burst-cycle fraction trim), (b) no smooth pacing is applied, (c) the
+// fullResend bit is cleared (CompareAndSwap consumed it), and (d) the round
+// metric increments.
+func TestRunOneRoundFullResendBypassesShaping(t *testing.T) {
+	cfg := &config.Config{
+		StoreCount:             2,
+		RegionCount:            20,
+		Replica:                1,
+		SmoothHeartbeatPacing:  true, // would normally pace; fullResend must override
+		BurstCycle:             true,
+		BurstCyclePeriodSec:    600,
+		BurstCycleHighSec:      60,
+		BurstCycleRampSec:      60,
+		BurstCycleHighFraction: 0.10,
+		BurstCycleLowFraction:  0.10, // would normally cut regions to 10%
+	}
+	rs := new(Regions)
+	rs.init(cfg)
+	forceAllRegionsToStore1(rs)
+
+	// Simulate a steady-round update having previously narrowed awakenRegions
+	// to a tiny subset. fullResend must IGNORE this and send rs.regions in full.
+	rs.awakenRegions.Store(rs.regions[:2])
+
+	stream := &timingHeartbeatStream{}
+	slot := makeTestSlot(t, context.Background(), cfg, stream)
+	slot.fullResendNeeded.Store(true)
+	statsCh := make(chan storeRoundStat, 1)
+
+	before := testCounterValue(t, heartbeatFullResendRounds)
+
+	start := time.Now()
+	runOneRound(context.Background(), cfg, rs, slot, 1, 100*time.Millisecond, statsCh)
+	elapsed := time.Since(start)
+
+	sends := stream.snapshot()
+	require.Len(t, sends, 20, "fullResend must send EVERY leader-owned region, not the awakenRegions subset nor the burst-cycle fraction")
+	require.LessOrEqual(t, elapsed, 30*time.Millisecond, "fullResend must skip per-region pacing (got %s; expected near-instant burst)", elapsed)
+	require.False(t, slot.fullResendNeeded.Load(), "CompareAndSwap must have cleared the bit")
+	require.Equal(t, before+1, testCounterValue(t, heartbeatFullResendRounds), "full-resend round metric must increment")
+
+	select {
+	case st := <-statsCh:
+		require.Equal(t, 20, st.sent)
+		require.True(t, st.fullResend)
+	default:
+		t.Fatalf("expected statsCh to receive one storeRoundStat")
+	}
+}
+
+// testCounterValue reads a single prometheus.Counter's current value via
+// Write() (the documented test API). Used to detect Inc() side-effects.
+func testCounterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	m := &dto.Metric{}
+	require.NoError(t, c.Write(m))
+	return m.GetCounter().GetValue()
+}
+
+// streamSlot.reconnect pointer-equality guard: after one goroutine rebuilds
+// the stream, a second goroutine calling reconnect with the OLD stream
+// pointer must observe s.stream != observed and return a no-op nil.
+func TestReconnectPointerEqualityGuard(t *testing.T) {
+	srv, addr, stop := startMockPD(t)
+	defer stop()
+	srv.setMembers(&pdpb.GetMembersResponse{
+		Header: &pdpb.ResponseHeader{ClusterId: 1},
+		Leader: &pdpb.Member{ClientUrls: []string{addr}},
+	}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := &config.Config{
+		PDAddr:                addr,
+		AutoReconnect:         true,
+		FullResendOnReconnect: true,
+	}
+	slot := newStreamSlot(ctx, cfg, 1)
+	oldStream := slot.stream
+
+	// First reconnect with the live stream pointer rebuilds. After it returns,
+	// s.stream != oldStream.
+	require.NoError(t, slot.reconnect(oldStream))
+	require.NotEqual(t, oldStream, slot.stream, "first reconnect must replace the stream")
+
+	// Second reconnect with the (now stale) oldStream must be a no-op nil.
+	preReconnects := slot.reconnects.Load()
+	require.NoError(t, slot.reconnect(oldStream))
+	require.Equal(t, preReconnects, slot.reconnects.Load(), "stale-pointer reconnect must NOT bump the reconnect counter")
+}
+
+// streamSlot.GetCli (and the in-line use in runMinResolvedTSReporter) must
+// observe the post-reconnect cli, not a snapshot of the boot-time cli.
+func TestGetCliReflectsPostReconnectLeader(t *testing.T) {
+	// Two PDs; first is initial leader, then leadership transfers to the second.
+	srvA, addrA, stopA := startMockPD(t)
+	defer stopA()
+	srvB, addrB, stopB := startMockPD(t)
+	defer stopB()
+
+	srvA.setMembers(&pdpb.GetMembersResponse{
+		Header: &pdpb.ResponseHeader{ClusterId: 1},
+		Leader: &pdpb.Member{ClientUrls: []string{addrA}},
+	}, nil)
+	srvB.setMembers(&pdpb.GetMembersResponse{
+		Header: &pdpb.ResponseHeader{ClusterId: 1},
+		Leader: &pdpb.Member{ClientUrls: []string{addrB}},
+	}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := &config.Config{
+		PDAddr:                addrA + "," + addrB,
+		AutoReconnect:         true,
+		FullResendOnReconnect: true,
+	}
+	slot := newStreamSlot(ctx, cfg, 1)
+	bootCli := slot.GetCli()
+	require.NotNil(t, bootCli)
+	require.Equal(t, addrA, slot.currentEp)
+
+	// Simulate leader transfer: A now points at B; reconnect should re-resolve.
+	srvA.setMembers(&pdpb.GetMembersResponse{
+		Header: &pdpb.ResponseHeader{ClusterId: 1},
+		Leader: &pdpb.Member{ClientUrls: []string{addrB}},
+	}, nil)
+	require.NoError(t, slot.reconnect(slot.stream))
+
+	require.Equal(t, addrB, slot.currentEp, "currentEp must move to new leader")
+	newCli := slot.GetCli()
+	require.NotEqual(t, bootCli, newCli, "GetCli must observe the post-reconnect cli (not a stale snapshot)")
+}
+
+// reconnect signalling kicks the worker so the post-reconnect round runs
+// immediately instead of waiting up to a full tickInterval.
+func TestReconnectSignalsKickChannel(t *testing.T) {
+	srv, addr, stop := startMockPD(t)
+	defer stop()
+	srv.setMembers(&pdpb.GetMembersResponse{
+		Header: &pdpb.ResponseHeader{ClusterId: 1},
+		Leader: &pdpb.Member{ClientUrls: []string{addr}},
+	}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := &config.Config{
+		PDAddr:                addr,
+		AutoReconnect:         true,
+		FullResendOnReconnect: true,
+	}
+	slot := newStreamSlot(ctx, cfg, 1)
+
+	// Drain any pre-existing signal.
+	select {
+	case <-slot.kickCh:
+	default:
+	}
+
+	require.NoError(t, slot.reconnect(slot.stream))
+	select {
+	case <-slot.kickCh:
+		// expected: reconnect pushed a kick.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected kickCh signal within 100ms after reconnect")
+	}
+	require.True(t, slot.fullResendNeeded.Load(), "fullResendOnReconnect must arm the bit")
+}
+
 type blockingReportBucketsClient struct {
 	ctx context.Context
 }
@@ -373,7 +699,32 @@ func TestPaceJitterIsWithinTenPercent(t *testing.T) {
 	require.Equal(t, time.Duration(0), paceJitter(0), "zero in zero out")
 }
 
-func TestHandleRegionHeartbeatSmoothPacesAcrossInterval(t *testing.T) {
+// makeTestSlot builds a streamSlot suitable for unit-testing runOneRound. We
+// skip resolvePDLeader entirely — the slot is wired to a caller-supplied
+// stream so send() exercises the same code path production uses without
+// needing a real gRPC server.
+func makeTestSlot(t *testing.T, ctx context.Context, cfg *config.Config, stream pdpb.PD_RegionHeartbeatClient) *streamSlot {
+	t.Helper()
+	return &streamSlot{
+		storeID: 1,
+		cfg:     cfg,
+		ctx:     ctx,
+		stream:  stream,
+		kickCh:  make(chan struct{}, 1),
+	}
+}
+
+func forceAllRegionsToStore1(rs *Regions) {
+	for _, r := range rs.regions {
+		if len(r.Region.Peers) == 0 {
+			continue
+		}
+		r.Leader = r.Region.Peers[0]
+		r.Leader.StoreId = 1
+	}
+}
+
+func TestRunOneRoundSmoothPacesAcrossInterval(t *testing.T) {
 	// 5 regions across a 100 ms paceInterval => per-region delay = 20 ms
 	// total expected wall-clock = 4 inter-send sleeps × 20 ms = 80 ms (last send no sleep)
 	// allow ±50% slack for jitter + scheduler noise.
@@ -385,24 +736,13 @@ func TestHandleRegionHeartbeatSmoothPacesAcrossInterval(t *testing.T) {
 	}
 	rs := new(Regions)
 	rs.init(cfg)
-	// Force every region's leader onto store 1 so handleRegionHeartbeat picks them all up.
-	for _, r := range rs.regions {
-		if len(r.Region.Peers) == 0 {
-			continue
-		}
-		r.Leader = r.Region.Peers[0]
-		r.Leader.StoreId = 1
-	}
+	forceAllRegionsToStore1(rs)
 	stream := &timingHeartbeatStream{}
-	rep := report.NewReport("%4.4f")
-	done := rep.Stats()
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
+	slot := makeTestSlot(t, context.Background(), cfg, stream)
+	statsCh := make(chan storeRoundStat, 1)
+
 	start := time.Now()
-	go rs.handleRegionHeartbeat(context.Background(), cfg, wg, stream, 1, rep, 100*time.Millisecond)
-	wg.Wait()
-	close(rep.Results())
-	<-done
+	runOneRound(context.Background(), cfg, rs, slot, 1, 100*time.Millisecond, statsCh)
 	elapsed := time.Since(start)
 
 	sends := stream.snapshot()
@@ -418,7 +758,7 @@ func TestHandleRegionHeartbeatSmoothPacesAcrossInterval(t *testing.T) {
 	}
 }
 
-func TestHandleRegionHeartbeatBurstyWhenSmoothDisabled(t *testing.T) {
+func TestRunOneRoundBurstyWhenSmoothDisabled(t *testing.T) {
 	// Same setup as the smooth test, but SmoothHeartbeatPacing=false: all sends should
 	// complete in milliseconds (no pacing).
 	cfg := &config.Config{
@@ -429,24 +769,13 @@ func TestHandleRegionHeartbeatBurstyWhenSmoothDisabled(t *testing.T) {
 	}
 	rs := new(Regions)
 	rs.init(cfg)
-	for _, r := range rs.regions {
-		if len(r.Region.Peers) == 0 {
-			continue
-		}
-		r.Leader = r.Region.Peers[0]
-		r.Leader.StoreId = 1
-	}
+	forceAllRegionsToStore1(rs)
 	stream := &timingHeartbeatStream{}
-	rep := report.NewReport("%4.4f")
-	done := rep.Stats()
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
+	slot := makeTestSlot(t, context.Background(), cfg, stream)
+	statsCh := make(chan storeRoundStat, 1)
+
 	start := time.Now()
-	// paceInterval is passed but should be ignored when smooth=false
-	go rs.handleRegionHeartbeat(context.Background(), cfg, wg, stream, 1, rep, 100*time.Millisecond)
-	wg.Wait()
-	close(rep.Results())
-	<-done
+	runOneRound(context.Background(), cfg, rs, slot, 1, 100*time.Millisecond, statsCh)
 	elapsed := time.Since(start)
 
 	sends := stream.snapshot()
@@ -454,7 +783,7 @@ func TestHandleRegionHeartbeatBurstyWhenSmoothDisabled(t *testing.T) {
 	require.LessOrEqual(t, elapsed, 30*time.Millisecond, "legacy bursty mode must NOT pace; all 5 sends in a few ms")
 }
 
-func TestHandleRegionHeartbeatRespectsContextCancel(t *testing.T) {
+func TestRunOneRoundRespectsContextCancel(t *testing.T) {
 	// Smooth pacing must exit promptly when ctx is cancelled.
 	cfg := &config.Config{
 		StoreCount:            2,
@@ -464,34 +793,26 @@ func TestHandleRegionHeartbeatRespectsContextCancel(t *testing.T) {
 	}
 	rs := new(Regions)
 	rs.init(cfg)
-	for _, r := range rs.regions {
-		if len(r.Region.Peers) == 0 {
-			continue
-		}
-		r.Leader = r.Region.Peers[0]
-		r.Leader.StoreId = 1
-	}
+	forceAllRegionsToStore1(rs)
 	stream := &timingHeartbeatStream{}
-	rep := report.NewReport("%4.4f")
-	done := rep.Stats()
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	slot := makeTestSlot(t, ctx, cfg, stream)
+	statsCh := make(chan storeRoundStat, 1)
 	// paceInterval = 10s across 1000 regions => 10ms per region, so a full natural run
 	// would be 10s. Cancelling after 50ms should exit within ~100ms total.
-	go rs.handleRegionHeartbeat(ctx, cfg, wg, stream, 1, rep, 10*time.Second)
+	done := make(chan struct{})
+	go func() {
+		runOneRound(ctx, cfg, rs, slot, 1, 10*time.Second, statsCh)
+		close(done)
+	}()
 	time.Sleep(50 * time.Millisecond)
 	cancel()
-	waitCh := make(chan struct{})
-	go func() { wg.Wait(); close(waitCh) }()
 	select {
-	case <-waitCh:
+	case <-done:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("handleRegionHeartbeat did not exit within 500ms of ctx cancel")
+		t.Fatalf("runOneRound did not exit within 500ms of ctx cancel")
 	}
-	close(rep.Results())
-	<-done
 
 	sends := stream.snapshot()
 	require.Less(t, len(sends), 50, "should have sent only a handful before cancel; got %d", len(sends))

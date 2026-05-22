@@ -63,3 +63,42 @@ buckets-after-first-heartbeat-round = true
 # Do NOT also raise region-heartbeat-qps "to smooth more" — that changes the
 # per-region cadence away from online (5/20 v2 misstep).
 smooth-heartbeat-pacing = false
+
+# v2.4 (2026-05-20) stagger-burst. When true, each per-store worker delays its first
+# round by (store_id - 1) * outer_tick / StoreCount so 100 stores enter their
+# steady cadence with even phase offsets. Composes with smooth-heartbeat-pacing —
+# v3.1 reduced this to a one-shot startup offset (workers' own tickers carry the
+# phase forward), so it is no longer mutually exclusive with smooth-pacing or
+# burst-cycle.
+stagger-burst = false
+
+# v2.5 (2026-05-20) collective burst-cycle. Overlays a wall-clock-phase-aware
+# fraction on each per-tick region count to reproduce the 10-minute HIGH/LOW cycle
+# observed on online cluster 10989049060142230334. Requires smooth-heartbeat-pacing
+# = true (the variable per-tick count must be spread across the tick window).
+# Defaults match the online cycle: 60 s HIGH (60 % of leader regions), 420 s LOW
+# (31 %), 60 s linear ramp each side.
+burst-cycle = false
+burst-cycle-period-sec = 600
+burst-cycle-high-sec = 60
+burst-cycle-ramp-sec = 60
+burst-cycle-high-fraction = 0.60
+burst-cycle-low-fraction = 0.31
+
+# v3.1 (2026-05-21) service discovery + leader-aware reconnect.
+#
+# auto-reconnect: when a per-store RegionHeartbeat stream errors (typically PD
+# closing it during leader transfer), discover the new PD leader via GetMembers
+# across all --pd-endpoints entries and rebuild the underlying gRPC connection.
+# Without this, the bench would silently stop heartbeating that store after the
+# first leader transfer.
+auto-reconnect = true
+
+# full-resend-on-reconnect: immediately after auto-reconnect rebuilds a stream,
+# burst-send a heartbeat for EVERY region this store leads (no burst-cycle
+# fraction, no per-region pacing). Models real TiKV behaviour — on PD reconnect
+# TiKV fires a full heartbeat round before resuming normal cadence — and drives
+# the post-stepdown ingress spike we observe on the line cluster. The worker
+# runs this round immediately (kicked through slot.kickCh) instead of waiting
+# up to a full tickInterval. Requires auto-reconnect = true.
+full-resend-on-reconnect = true

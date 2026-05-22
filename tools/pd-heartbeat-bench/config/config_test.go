@@ -40,6 +40,74 @@ func TestParseKeepsSchemePDEndpoint(t *testing.T) {
 	require.Equal(t, "https://127.0.0.1:12379", cfg.PDAddr)
 }
 
+// v3.1.4 (2026-05-21): regression — multi-endpoint inputs must get a scheme on
+// EACH part. The pre-v3.1.4 normalizer only added "http://" to the head, which
+// left the tail bare host:port and broke resolvePDLeader's grpcutil.GetClientConn
+// (url.Parse rejects bare host:port with "first path segment in URL cannot
+// contain colon"). See big-pd-pressure heartbeat-bench-reconnect-review.md.
+func TestParseNormalizesAllCommaSeparatedEndpoints(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "all bare",
+			in:   "127.0.0.1:2379,127.0.0.1:2380,127.0.0.1:2381",
+			want: "http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381",
+		},
+		{
+			name: "scheme on head only",
+			in:   "http://127.0.0.1:2379,127.0.0.1:2380",
+			want: "http://127.0.0.1:2379,http://127.0.0.1:2380",
+		},
+		{
+			name: "mixed schemes preserved",
+			in:   "https://10.0.0.1:2379,http://10.0.0.2:2379,10.0.0.3:2379",
+			want: "https://10.0.0.1:2379,http://10.0.0.2:2379,http://10.0.0.3:2379",
+		},
+		{
+			name: "whitespace trimmed",
+			in:   "127.0.0.1:2379, 127.0.0.1:2380 ,127.0.0.1:2381",
+			want: "http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := NewConfig()
+			require.NoError(t, cfg.Parse([]string{"--pd-endpoints", tc.in}))
+			require.Equal(t, tc.want, cfg.PDAddr)
+		})
+	}
+}
+
+func TestSplitEndpoints(t *testing.T) {
+	cases := []struct {
+		name string
+		addr string
+		want []string
+	}{
+		{name: "single", addr: "http://127.0.0.1:2379", want: []string{"http://127.0.0.1:2379"}},
+		{
+			name: "multi",
+			addr: "http://10.0.0.1:2379,http://10.0.0.2:2379",
+			want: []string{"http://10.0.0.1:2379", "http://10.0.0.2:2379"},
+		},
+		{
+			name: "drops empty",
+			addr: "http://10.0.0.1:2379,,http://10.0.0.2:2379",
+			want: []string{"http://10.0.0.1:2379", "http://10.0.0.2:2379"},
+		},
+		{name: "empty input", addr: "", want: []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{PDAddr: tc.addr}
+			require.Equal(t, tc.want, cfg.SplitEndpoints())
+		})
+	}
+}
+
 func TestParseWithoutConfigUsesDefaults(t *testing.T) {
 	cfg := NewConfig()
 

@@ -103,6 +103,87 @@ which are hard to hit with bursty mode because the burst transiently spikes CPU
 to ~47 cores. v2.3 smooth pacing is the recommended way to reach the envelope
 without going through the "raise qps" anti-pattern.
 
+## v2.4 Stagger-Burst & v2.5 Burst-Cycle (2026-05-20)
+
+`stagger-burst` (default `false`): each per-store worker waits
+`(store_id - 1) * outer_tick / StoreCount` before its first heartbeat round.
+This is a one-shot startup phase offset — once the worker's own ticker is
+running the offset is permanent. With smooth-pacing, the result is a
+continuous Region-heartbeat arrival pattern at PD that mirrors what online
+clusters look like through Grafana's "Region heartbeat report" panel.
+
+`burst-cycle` (default `false`, requires `smooth-heartbeat-pacing = true`):
+overlays a wall-clock-phase-aware fraction on each tick's region count to
+reproduce the 10-minute collective HIGH/LOW cycle observed on cluster
+10989049060142230334. Knobs: `burst-cycle-period-sec` (default 600),
+`burst-cycle-high-sec` (60), `burst-cycle-ramp-sec` (60),
+`burst-cycle-high-fraction` (0.60), `burst-cycle-low-fraction` (0.31).
+
+These two knobs are orthogonal and compose. They are mutually exclusive with
+neither each other nor smooth-pacing (the v2.4 mutex assumption was removed in
+v3.1 — see `Adjust` source for the surviving invariants).
+
+## v3.1 Service Discovery & Leader-Aware Reconnect (2026-05-21)
+
+The v3.1 stream model gives every store its own RegionHeartbeat stream and a
+mini service-discovery layer so the bench survives PD leader transfers without
+silent stalls.
+
+```toml
+auto-reconnect = true             # default true
+full-resend-on-reconnect = true   # default true
+```
+
+**Behaviour on PD leader switch.** When the per-store stream's `Recv()`
+returns an error (PD closes the stream during leader transfer), the slot:
+
+1. Backs off 200-500 ms (randomised; prevents 100 stores reconnect-storming
+   PD simultaneously).
+2. Calls `resolvePDLeader`, which probes each `--pd-endpoints` entry in turn
+   with a `GetMembers` RPC, follows the response's `leader.client_urls` to
+   the actual leader, and rebuilds the underlying gRPC `ClientConn` against
+   the new endpoint.
+3. Arms `fullResendNeeded` and pushes a one-shot kick into the worker's
+   `kickCh`, causing the worker to run the post-reconnect round **immediately**
+   (not at the next tick boundary).
+4. The post-reconnect round sends **every** region this store leads, bypassing
+   both the burst-cycle fraction and per-region pacing — matching real TiKV's
+   behaviour, which fires a full heartbeat the instant the new PD stream is
+   ready. The ticker is then reset so the next steady round is one full
+   `tickInterval` after the burst.
+
+**Bug fixes vs v3.1.3.** The original v3.1.3 implementation had four
+correctness bugs (see
+`docs/big-pd-pressure/heartbeat-bench-reconnect-review.md`):
+
+1. `resolvePDLeader` stripped the scheme off the leader's `ClientUrls`
+   before passing to `grpcutil.GetClientConn`, which fails URL parsing on
+   bare `host:port` — so the "redirect to leader" path always errored out.
+   v3.1.4 keeps the full URL throughout and compares via `canonicalEndpoint`.
+2. `normalizePDAddr` added scheme only to the head of a comma-separated
+   `--pd-endpoints` string, leaving subsequent entries scheme-less. v3.1.4
+   normalises each entry independently.
+3. `clis[id] = slots[id].cli` captured the boot-time PDClient and never
+   updated on reconnect, so `ReportMinResolvedTS` continued targeting the
+   ex-leader after a transfer. v3.1.4 reads `slot.GetCli()` at call time.
+4. The bucket factory was bound to a single boot-time `cli`. v3.1.4 uses a
+   leader-aware factory that re-resolves on stream restart (with a 1 s
+   coalescing window so a herd of N workers doesn't storm `GetMembers`).
+
+**Concurrency model.** `send()` and `drainRecv()` race-trigger `reconnect()`
+on the same broken stream. `reconnect(observed)` is guarded by pointer
+equality (`s.stream != observed → no-op return nil`), so the loser of the
+race becomes a free no-op instead of tearing down the freshly-built stream.
+
+**Observability.** The bench exports its own metrics on `status-addr/metrics`
+(default `127.0.0.1:20180/metrics`):
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `pd_heartbeat_bench_stream_reconnects_total` | `store_id` | Successful reconnects per store. |
+| `pd_heartbeat_bench_stream_errors_total` | `store_id`, `phase` (`send`, `reconnect_failed`, `drainrecv_reconnect_failed`) | Send + reconnect failure counts. |
+| `pd_heartbeat_bench_full_resend_rounds_total` |  | Total post-reconnect full-resend rounds across the cluster. |
+
 Build:
 
 ```shell

@@ -387,11 +387,40 @@ func isDefined(meta *toml.MetaData, key string) bool {
 	return meta != nil && meta.IsDefined(key)
 }
 
+// normalizePDAddr applies a scheme prefix to each comma-separated endpoint that
+// lacks one. The old single-string check (Contains("://")) was incorrect for
+// multi-endpoint input: passing "ep1:2379,ep2:2379" left the entire string
+// without scheme so we'd prepend "http://" once to the head, and the tail
+// endpoints after splitting would still be bare host:port which grpcutil's
+// url.Parse rejects with `first path segment in URL cannot contain colon`.
 func normalizePDAddr(addr string) string {
-	if addr == "" || strings.Contains(addr, "://") {
+	if addr == "" {
 		return addr
 	}
-	return "http://" + addr
+	parts := strings.Split(addr, ",")
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" && !strings.Contains(p, "://") {
+			p = "http://" + p
+		}
+		parts[i] = p
+	}
+	return strings.Join(parts, ",")
+}
+
+// SplitEndpoints returns the normalized PD endpoints as a slice. Trims empty
+// entries. Use this whenever a caller needs to dial endpoints individually
+// (resolvePDLeader, pdHttp.NewClient).
+func (c *Config) SplitEndpoints() []string {
+	parts := strings.Split(c.PDAddr, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // Validate is used to validate configurations
