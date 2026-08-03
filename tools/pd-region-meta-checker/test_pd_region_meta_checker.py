@@ -217,33 +217,64 @@ class CheckerCLITest(unittest.TestCase):
         self.assertEqual(report["status"], "inconsistent")
         self.assertEqual(report["summary"]["different_regions"], 5)
         self.assertEqual(
-            report["summary"]["category_counts"],
-            {"epoch": 1, "key_range": 1, "leader": 1, "missing": 1, "peers": 1},
+            report["summary"]["by_field"],
+            {
+                "missing_on": 1,
+                "key_range": 1,
+                "epoch": 1,
+                "peers": 1,
+                "leader_peer": 1,
+            },
         )
-        self.assertEqual(
-            report["summary"]["only_category_counts"],
-            report["summary"]["category_counts"],
-        )
-        categories = {item["region_id"]: item["categories"] for item in report["differences"]}
-        self.assertEqual(categories[1], ["epoch"])
-        self.assertEqual(categories[2], ["key_range"])
-        self.assertEqual(categories[3], ["leader"])
-        self.assertEqual(categories[4], ["peers"])
-        self.assertEqual(categories[5], ["missing"])
-        missing = next(item for item in report["differences"] if item["region_id"] == 5)
-        self.assertIsNone(missing["nodes"]["pd-follower"])
+        differences = {item["region_id"]: item for item in report["differences"]}
+        self.assertEqual(set(differences[1]), {"region_id", "epoch"})
+        self.assertEqual(differences[1]["epoch"]["pd-follower"]["version"], 2)
+        self.assertEqual(set(differences[2]), {"region_id", "key_range"})
+        self.assertEqual(differences[2]["key_range"]["pd-follower"]["start_key"], "11")
+        self.assertEqual(set(differences[3]), {"region_id", "leader_peer"})
+        self.assertEqual(differences[3]["leader_peer"]["pd-follower"]["id"], 31)
+        self.assertEqual(set(differences[4]), {"region_id", "peers"})
+        self.assertEqual(differences[4]["peers"]["pd-follower"][-1]["id"], 41)
+        self.assertEqual(differences[5], {"region_id": 5, "missing_on": ["pd-follower"]})
 
-    def test_distinguishes_pd_leader_outlier_from_region_leader_field(self):
+    def test_reports_pd_leader_peer_values_directly(self):
         self.leader.server.regions[2]["leader"] = peer(31, 2)
 
         result = self.run_checker()
         self.assertEqual(result.returncode, 1, result.stderr)
         report = json.loads(result.stdout)
-        difference = report["differences"][0]
-        self.assertEqual(difference["categories"], ["leader"])
-        self.assertEqual(difference["node_scope"]["classification"], "pd_leader_only")
-        self.assertEqual(difference["node_scope"]["outlier_nodes"], ["pd-leader"])
-        self.assertEqual(report["summary"]["only_category_counts"], {"leader": 1})
+        self.assertEqual(
+            report["differences"],
+            [
+                {
+                    "region_id": 3,
+                    "leader_peer": {
+                        "pd-leader": {
+                            "id": 31,
+                            "store_id": 2,
+                            "role": 0,
+                            "is_witness": False,
+                        },
+                        "pd-follower": {
+                            "id": 30,
+                            "store_id": 1,
+                            "role": 0,
+                            "is_witness": False,
+                        },
+                        "pd-follower-2": {
+                            "id": 30,
+                            "store_id": 1,
+                            "role": 0,
+                            "is_witness": False,
+                        },
+                    },
+                }
+            ],
+        )
+        self.assertEqual(
+            report["summary"],
+            {"different_regions": 1, "by_field": {"leader_peer": 1}},
+        )
 
     def test_reports_leader_peer_only_and_multi_axis_no_consensus(self):
         # Region 3 only disagrees on the elected Region Leader peer.
@@ -261,39 +292,27 @@ class CheckerCLITest(unittest.TestCase):
         differences = {item["region_id"]: item for item in report["differences"]}
 
         leader_only = differences[3]
-        follower_only = {
-            "classification": "single_follower_only",
-            "outlier_nodes": ["pd-follower"],
-        }
-        self.assertEqual(leader_only["categories"], ["leader"])
-        self.assertEqual(leader_only["node_scope"], follower_only)
-        self.assertEqual(leader_only["category_scope"]["leader"], follower_only)
+        self.assertEqual(set(leader_only), {"region_id", "leader_peer"})
         self.assertEqual(
-            leader_only["nodes"]["pd-leader"]["peers"],
-            leader_only["nodes"]["pd-follower"]["peers"],
+            leader_only["leader_peer"]["pd-follower"]["id"],
+            31,
         )
 
         multi_axis = differences[2]
-        self.assertEqual(multi_axis["categories"], ["key_range", "epoch"])
-        self.assertEqual(multi_axis["node_scope"]["classification"], "no_consensus")
+        self.assertEqual(set(multi_axis), {"region_id", "key_range", "epoch"})
         self.assertEqual(
-            multi_axis["category_scope"]["key_range"]["classification"],
-            "no_consensus",
-        )
-        self.assertEqual(
-            multi_axis["category_scope"]["epoch"]["classification"],
-            "no_consensus",
-        )
-        self.assertEqual(
-            multi_axis["nodes"]["pd-follower"]["epoch"],
+            multi_axis["epoch"]["pd-follower"],
             {"conf_ver": 1, "version": 2},
         )
         self.assertEqual(
-            multi_axis["nodes"]["pd-follower-2"]["epoch"],
+            multi_axis["epoch"]["pd-follower-2"],
             {"conf_ver": 2, "version": 1},
         )
         self.assertEqual(report["summary"]["different_regions"], 2)
-        self.assertEqual(report["summary"]["only_category_counts"], {"leader": 1})
+        self.assertEqual(
+            report["summary"]["by_field"],
+            {"key_range": 1, "epoch": 1, "leader_peer": 1},
+        )
 
     def test_ignores_peer_order_and_non_meta_heartbeat_fields(self):
         for server in (self.follower.server, self.follower_2.server):
@@ -379,7 +398,7 @@ class CheckerCLITest(unittest.TestCase):
         report = json.loads(result.stdout)
         self.assertEqual(report["status"], "incomplete")
         self.assertEqual(report["confirmation"]["result"], "confirmation_disabled")
-        self.assertEqual(report["differences"][0]["categories"], ["epoch"])
+        self.assertEqual(set(report["differences"][0]), {"region_id", "epoch"})
 
     def test_confirms_large_static_difference_set_with_bounded_requests(self):
         for item in self.follower.server.regions:

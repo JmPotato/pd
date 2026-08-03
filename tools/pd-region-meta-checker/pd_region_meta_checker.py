@@ -24,7 +24,13 @@ LOCAL_HEADERS = {
     "PD-Redirector": CALLER_ID,
     "X-Caller-ID": CALLER_ID,
 }
-CATEGORY_ORDER = ("missing", "key_range", "epoch", "peers", "leader")
+REPORT_FIELDS = {
+    "missing": "missing_on",
+    "key_range": "key_range",
+    "epoch": "epoch",
+    "peers": "peers",
+    "leader": "leader_peer",
+}
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 UINT64_MAX = (1 << 64) - 1
@@ -449,21 +455,10 @@ def category_value(category, meta):
     if meta is None:
         return None
     if category == "key_range":
-        return (meta["start_key"], meta["end_key"])
+        return {"start_key": meta["start_key"], "end_key": meta["end_key"]}
     if category == "epoch":
-        return (meta["epoch"]["conf_ver"], meta["epoch"]["version"])
-    return json.dumps(meta[category], sort_keys=True, separators=(",", ":"))
-
-
-def classify_scope(values, nodes):
-    encoded = [json.dumps(value, sort_keys=True, separators=(",", ":")) for value in values]
-    counts = collections.Counter(encoded)
-    if len(nodes) >= 3 and len(counts) == 2 and sorted(counts.values()) == [1, len(nodes) - 1]:
-        outlier_value = next(value for value, count in counts.items() if count == 1)
-        outlier = nodes[encoded.index(outlier_value)]
-        classification = "pd_leader_only" if outlier.role == "leader" else "single_follower_only"
-        return {"classification": classification, "outlier_nodes": [outlier.name]}
-    return {"classification": "no_consensus", "outlier_nodes": []}
+        return meta["epoch"]
+    return meta[category]
 
 
 def make_difference(region_id, rows, nodes):
@@ -473,7 +468,7 @@ def make_difference(region_id, rows, nodes):
 
     values_by_category = {
         category: [category_value(category, meta) for meta in metas]
-        for category in CATEGORY_ORDER
+        for category in REPORT_FIELDS
     }
     categories = []
     for category, values in values_by_category.items():
@@ -487,20 +482,20 @@ def make_difference(region_id, rows, nodes):
     if not categories:
         return None
 
-    full_values = [
-        None if meta is None else json.dumps(meta, sort_keys=True, separators=(",", ":"))
-        for meta in metas
-    ]
-    return {
-        "region_id": region_id,
-        "categories": categories,
-        "node_scope": classify_scope(full_values, nodes),
-        "category_scope": {
-            category: classify_scope(values_by_category[category], nodes)
-            for category in categories
-        },
-        "nodes": {node.name: metas[node.index] for node in nodes},
-    }
+    difference = {"region_id": region_id}
+    if "missing" in categories:
+        difference["missing_on"] = [
+            node.name for node in nodes if metas[node.index] is None
+        ]
+    for category in categories:
+        if category == "missing":
+            continue
+        difference[REPORT_FIELDS[category]] = {
+            node.name: values_by_category[category][node.index]
+            for node in nodes
+            if metas[node.index] is not None
+        }
+    return difference
 
 
 def iter_differences(db, nodes):
@@ -522,29 +517,18 @@ def get_difference(db, nodes, region_id):
 
 
 def summarize(db, nodes):
-    category_counts = collections.Counter()
-    only_counts = collections.Counter()
-    scope_counts = collections.Counter()
+    field_counts = collections.Counter()
     different_regions = 0
     for difference in iter_differences(db, nodes):
         different_regions += 1
-        category_counts.update(difference["categories"])
-        if len(difference["categories"]) == 1:
-            only_counts.update(difference["categories"])
-        scope_counts.update([difference["node_scope"]["classification"]])
+        field_counts.update(field for field in REPORT_FIELDS.values() if field in difference)
     return {
         "different_regions": different_regions,
-        "category_counts": {
-            category: category_counts[category]
-            for category in CATEGORY_ORDER
-            if category_counts[category]
+        "by_field": {
+            field: field_counts[field]
+            for field in REPORT_FIELDS.values()
+            if field_counts[field]
         },
-        "only_category_counts": {
-            category: only_counts[category]
-            for category in CATEGORY_ORDER
-            if only_counts[category]
-        },
-        "node_scope_counts": dict(sorted(scope_counts.items())),
     }
 
 
