@@ -245,6 +245,56 @@ class CheckerCLITest(unittest.TestCase):
         self.assertEqual(difference["node_scope"]["outlier_nodes"], ["pd-leader"])
         self.assertEqual(report["summary"]["only_category_counts"], {"leader": 1})
 
+    def test_reports_leader_peer_only_and_multi_axis_no_consensus(self):
+        # Region 3 only disagrees on the elected Region Leader peer.
+        self.follower.server.regions[2]["leader"] = peer(31, 2)
+
+        # Region 2 has three different ranges and Epoch pairs across the PD members.
+        self.follower.server.regions[1]["start_key"] = "11"
+        self.follower.server.regions[1]["epoch"]["version"] = 2
+        self.follower_2.server.regions[1]["end_key"] = "21"
+        self.follower_2.server.regions[1]["epoch"]["conf_ver"] = 2
+
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        differences = {item["region_id"]: item for item in report["differences"]}
+
+        leader_only = differences[3]
+        follower_only = {
+            "classification": "single_follower_only",
+            "outlier_nodes": ["pd-follower"],
+        }
+        self.assertEqual(leader_only["categories"], ["leader"])
+        self.assertEqual(leader_only["node_scope"], follower_only)
+        self.assertEqual(leader_only["category_scope"]["leader"], follower_only)
+        self.assertEqual(
+            leader_only["nodes"]["pd-leader"]["peers"],
+            leader_only["nodes"]["pd-follower"]["peers"],
+        )
+
+        multi_axis = differences[2]
+        self.assertEqual(multi_axis["categories"], ["key_range", "epoch"])
+        self.assertEqual(multi_axis["node_scope"]["classification"], "no_consensus")
+        self.assertEqual(
+            multi_axis["category_scope"]["key_range"]["classification"],
+            "no_consensus",
+        )
+        self.assertEqual(
+            multi_axis["category_scope"]["epoch"]["classification"],
+            "no_consensus",
+        )
+        self.assertEqual(
+            multi_axis["nodes"]["pd-follower"]["epoch"],
+            {"conf_ver": 1, "version": 2},
+        )
+        self.assertEqual(
+            multi_axis["nodes"]["pd-follower-2"]["epoch"],
+            {"conf_ver": 2, "version": 1},
+        )
+        self.assertEqual(report["summary"]["different_regions"], 2)
+        self.assertEqual(report["summary"]["only_category_counts"], {"leader": 1})
+
     def test_ignores_peer_order_and_non_meta_heartbeat_fields(self):
         for server in (self.follower.server, self.follower_2.server):
             server.regions[2]["peers"].reverse()
