@@ -54,6 +54,10 @@ class Node:
     url: str
     role: str
 
+    @property
+    def instance(self):
+        return f"{self.name}@{urlsplit(self.url).netloc}"
+
 
 @dataclass
 class ScanState:
@@ -485,13 +489,13 @@ def make_difference(region_id, rows, nodes):
     difference = {"region_id": region_id}
     if "missing" in categories:
         difference["missing_on"] = [
-            node.name for node in nodes if metas[node.index] is None
+            node.instance for node in nodes if metas[node.index] is None
         ]
     for category in categories:
         if category == "missing":
             continue
         difference[REPORT_FIELDS[category]] = {
-            node.name: values_by_category[category][node.index]
+            node.instance: values_by_category[category][node.index]
             for node in nodes
             if metas[node.index] is not None
         }
