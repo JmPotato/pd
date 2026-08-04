@@ -3,6 +3,9 @@ round = 0
 store-count = 100
 region-count = 2000000
 
+# Maximum global Region heartbeats sent per second. 0 means unlimited.
+heartbeat-rate = 0
+
 replica = 3
 
 leader-update-ratio = 0.06

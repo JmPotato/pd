@@ -4,6 +4,7 @@ import copy
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,6 +39,12 @@ def region(region_id, start_key, end_key, peers=None, leader=None):
 class PDHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
+        self.server.request_paths.append(parsed.path)
+        if parsed.path == self.server.failure_path:
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if parsed.path == "/pd/api/v1/members":
             return self._json(self.server.members)
         if parsed.path.startswith("/pd/api/v1/region/id/"):
@@ -62,6 +69,8 @@ class PDHandler(BaseHTTPRequestHandler):
             start = query.get("key", [""])[0].upper()
             end = query.get("end_key", [""])[0].upper()
             limit = int(query.get("limit", ["16"])[0])
+            if self.server.page_limit is not None:
+                limit = min(limit, self.server.page_limit)
             regions = copy.deepcopy([
                 item
                 for item in self.server.regions
@@ -113,6 +122,9 @@ class FakePD:
         self.server.count_hook = None
         self.server.scan_calls = 0
         self.server.scan_hook = None
+        self.server.page_limit = None
+        self.server.request_paths = []
+        self.server.failure_path = None
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     @property
@@ -190,6 +202,9 @@ class CheckerCLITest(unittest.TestCase):
         self.assertEqual(report["status"], "consistent")
         self.assertEqual(report["summary"]["different_regions"], 0)
         self.assertEqual(report["reference"]["name"], "pd-leader")
+        self.assertEqual(report["settings"]["http_requests"], 17)
+        self.assertGreater(report["settings"]["http_response_bytes"], 0)
+        self.assertEqual(report["settings"]["temporary_disk_peak_bytes"], 0)
 
         for server in (self.leader.server, self.follower.server, self.follower_2.server):
             self.assertTrue(server.scan_queries)
@@ -206,6 +221,33 @@ class CheckerCLITest(unittest.TestCase):
                     for _, _, redirector in server.local_headers
                 )
             )
+
+    def test_writes_json_report_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            work_dir = Path(directory) / "work"
+            work_dir.mkdir()
+            result = self.run_checker(
+                "--work-dir",
+                str(work_dir),
+                "--output",
+                str(output),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "consistent")
+            self.assertEqual(list(work_dir.iterdir()), [])
+
+    def test_rejects_authorization_over_plain_http(self):
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as auth:
+            auth.write("Bearer secret\n")
+            auth.flush()
+            result = self.run_checker("--authorization-file", auth.name)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Authorization requires HTTPS", result.stderr)
+        self.assertEqual(self.leader.server.local_headers, [])
 
     def test_identifies_instances_by_member_name_and_endpoint(self):
         self.follower.server.regions[0]["epoch"]["version"] = 2
@@ -336,6 +378,29 @@ class CheckerCLITest(unittest.TestCase):
             {"key_range": 1, "epoch": 1, "leader_peer": 1},
         )
 
+    def test_matches_region_ids_across_divergent_key_segments(self):
+        moved = copy.deepcopy(self.leader.server.regions[0])
+        moved["start_key"] = "10"
+        moved["end_key"] = "20"
+        replacement = region(9, "", "10")
+        self.follower.server.regions[0:2] = [replacement, moved]
+
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        differences = {item["region_id"]: item for item in report["differences"]}
+        self.assertEqual(set(differences), {1, 2, 9})
+        self.assertEqual(set(differences[1]), {"region_id", "key_range"})
+        self.assertEqual(
+            differences[1]["key_range"][self.follower_instance],
+            {"start_key": "10", "end_key": "20"},
+        )
+        self.assertEqual(differences[2]["missing_on"], [self.follower_instance])
+        self.assertEqual(
+            differences[9]["missing_on"],
+            [self.leader_instance, self.follower_2_instance],
+        )
+
     def test_ignores_peer_order_and_non_meta_heartbeat_fields(self):
         for server in (self.follower.server, self.follower_2.server):
             server.regions[2]["peers"].reverse()
@@ -357,6 +422,26 @@ class CheckerCLITest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("--batch-size must be in [1, 1024]", result.stderr)
 
+    def test_rejects_non_finite_request_timing(self):
+        for flag, value in (("--interval", "nan"), ("--timeout", "inf")):
+            with self.subTest(flag=flag, value=value):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), self.leader.url, flag, value],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(
+                    "--interval must be finite and non-negative", result.stderr
+                )
+
+    def test_bounds_page_requests_when_api_returns_short_pages(self):
+        self.leader.server.page_limit = 1
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("exceeded the bounded Region page count", result.stderr)
+
     def test_rejects_invalid_endpoint_without_traceback(self):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "http://127.0.0.1:not-a-port"],
@@ -367,6 +452,28 @@ class CheckerCLITest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("invalid PD URL", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_does_not_retry_an_oversized_response(self):
+        self.leader.server.members["padding"] = "x" * (8 * 1024 * 1024)
+
+        result = self.run_checker("--retries", "2")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("response exceeds 8 MiB", result.stderr)
+        self.assertEqual(
+            self.leader.server.request_paths.count("/pd/api/v1/members"), 1
+        )
+
+    def test_default_does_not_retry_a_retryable_http_error(self):
+        self.leader.server.failure_path = "/pd/api/v1/regions/count"
+
+        result = self.run_checker()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("HTTP 503", result.stderr)
+        self.assertEqual(
+            self.leader.server.request_paths.count("/pd/api/v1/regions/count"), 1
+        )
 
     def test_accepts_uint64_region_ids_and_epoch(self):
         large_uint64 = 2**63 + 1
@@ -391,11 +498,93 @@ class CheckerCLITest(unittest.TestCase):
                 server.regions.append(region(6, "50", ""))
 
         self.leader.server.count_hook = split_after_leader_count
-        result = self.run_checker()
+        result = self.run_checker("--scan-retries", "1")
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual(report["status"], "consistent")
         self.assertEqual([node["scan_attempts"] for node in report["nodes"]], [2, 2, 2])
+
+    def test_default_does_not_repeat_a_full_cluster_scan(self):
+        def split_after_leader_count(count_calls):
+            if count_calls != 2:
+                return
+            self.leader.server.count_hook = None
+            for server in (self.leader.server, self.follower.server, self.follower_2.server):
+                server.regions[-1]["end_key"] = "50"
+                server.regions.append(region(6, "50", ""))
+
+        self.leader.server.count_hook = split_after_leader_count
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unstable Region set after 1 cluster-wide scan attempt", result.stderr)
+        self.assertEqual(self.leader.server.scan_calls, 3)
+
+    def test_temporary_json_limit_is_enforced_and_cleaned(self):
+        count = 6000
+        base = [
+            region(
+                item + 1,
+                "" if item == 0 else f"{item:08X}",
+                "" if item == count - 1 else f"{item + 1:08X}",
+            )
+            for item in range(count)
+        ]
+        self.leader.server.regions = copy.deepcopy(base)
+        self.follower.server.regions = copy.deepcopy(base)
+        self.follower_2.server.regions = copy.deepcopy(base)
+        for item in self.follower.server.regions:
+            item["epoch"]["version"] = 2
+
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory) / "work"
+            work_dir.mkdir()
+            result = self.run_checker(
+                "--batch-size",
+                "1024",
+                "--work-dir",
+                str(work_dir),
+                "--max-temporary-disk-mib",
+                "1",
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("temporary JSON data exceeds 1 MiB", result.stderr)
+            self.assertEqual(list(work_dir.iterdir()), [])
+
+    def test_output_limit_preserves_existing_report_and_cleans_work_files(self):
+        count = 6000
+        base = [
+            region(
+                item + 1,
+                "" if item == 0 else f"{item:08X}",
+                "" if item == count - 1 else f"{item + 1:08X}",
+            )
+            for item in range(count)
+        ]
+        self.leader.server.regions = copy.deepcopy(base)
+        self.follower.server.regions = copy.deepcopy(base)
+        self.follower_2.server.regions = copy.deepcopy(base)
+        for item in self.follower.server.regions:
+            item["epoch"]["version"] = 2
+
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory) / "work"
+            work_dir.mkdir()
+            output = Path(directory) / "report.json"
+            output.write_text("existing report\n", encoding="utf-8")
+            result = self.run_checker(
+                "--batch-size",
+                "1024",
+                "--work-dir",
+                str(work_dir),
+                "--max-output-mib",
+                "1",
+                "--output",
+                str(output),
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("JSON report exceeds 1 MiB", result.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"), "existing report\n")
+            self.assertEqual(list(work_dir.iterdir()), [])
 
     def test_rechecks_transient_meta_differences(self):
         def update_after_first_leader_page(scan_calls):
@@ -412,6 +601,19 @@ class CheckerCLITest(unittest.TestCase):
         self.assertEqual(report["status"], "consistent")
         self.assertEqual(report["confirmation"]["initial_differences"], 1)
         self.assertEqual(report["confirmation"]["result"], "resolved")
+
+    def test_rejects_member_identity_change_during_scan(self):
+        def rename_member_after_first_page(scan_calls):
+            if scan_calls != 1:
+                return
+            self.leader.server.scan_hook = None
+            self.leader.server.members["members"][1]["name"] = "pd-renamed"
+
+        self.leader.server.scan_hook = rename_member_after_first_page
+        result = self.run_checker()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("PD membership or leader changed during the scan", result.stderr)
 
     def test_marks_unconfirmed_differences_incomplete(self):
         self.follower.server.regions[0]["epoch"]["version"] = 2

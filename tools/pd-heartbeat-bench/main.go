@@ -50,6 +50,7 @@ import (
 	"github.com/tikv/pd/tools/pd-heartbeat-bench/metrics"
 	"go.etcd.io/etcd/pkg/v3/report"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -343,7 +344,7 @@ func createHeartbeatStream(ctx context.Context, cfg *config.Config) (pdpb.PDClie
 	return cli, stream
 }
 
-func (rs *Regions) handleRegionHeartbeat(wg *sync.WaitGroup, stream pdpb.PD_RegionHeartbeatClient, storeID uint64, rep report.Report) {
+func (rs *Regions) handleRegionHeartbeat(ctx context.Context, wg *sync.WaitGroup, stream pdpb.PD_RegionHeartbeatClient, storeID uint64, rep report.Report, limiter *rate.Limiter) {
 	defer wg.Done()
 	var regions, toUpdate []*pdpb.RegionHeartbeatRequest
 	updatedRegions := rs.awakenRegions.Load()
@@ -362,6 +363,11 @@ func (rs *Regions) handleRegionHeartbeat(wg *sync.WaitGroup, stream pdpb.PD_Regi
 	start := time.Now()
 	var err error
 	for _, region := range regions {
+		if limiter != nil {
+			if err = limiter.Wait(ctx); err != nil {
+				return
+			}
+		}
 		err = stream.Send(region)
 		rep.Results() <- report.Result{Start: start, End: time.Now(), Err: err}
 		if err == io.EOF {
@@ -531,6 +537,10 @@ func main() {
 	resolvedTSTicker := time.NewTicker(time.Second)
 	defer resolvedTSTicker.Stop()
 	withMetric := metrics.InitMetric2Collect(cfg.MetricsAddr)
+	var heartbeatLimiter *rate.Limiter
+	if cfg.HeartbeatRate > 0 {
+		heartbeatLimiter = rate.NewLimiter(rate.Limit(cfg.HeartbeatRate), 1)
+	}
 	for {
 		select {
 		case <-heartbeatTicker.C:
@@ -545,7 +555,7 @@ func main() {
 			for i := 1; i <= cfg.StoreCount; i++ {
 				id := uint64(i)
 				wg.Add(1)
-				go regions.handleRegionHeartbeat(wg, streams[id], id, rep)
+				go regions.handleRegionHeartbeat(ctx, wg, streams[id], id, rep, heartbeatLimiter)
 			}
 			if withMetric {
 				metrics.CollectMetrics(regions.updateRound, time.Second)

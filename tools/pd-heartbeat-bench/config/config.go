@@ -51,6 +51,7 @@ type Config struct {
 	SpaceUpdateRatio  float64 `toml:"space-update-ratio" json:"space-update-ratio"`
 	FlowUpdateRatio   float64 `toml:"flow-update-ratio" json:"flow-update-ratio"`
 	ReportRatio       float64 `toml:"report-ratio" json:"report-ratio"`
+	HeartbeatRate     int     `toml:"heartbeat-rate" json:"heartbeat-rate"`
 	Sample            bool    `toml:"sample" json:"sample"`
 	Round             int     `toml:"round" json:"round"`
 	MetricsAddr       string  `toml:"metrics-addr" json:"metrics-addr"`
@@ -70,6 +71,7 @@ func NewConfig() *Config {
 	fs.StringVar(&cfg.Security.CertPath, "cert", "", "path of file that contains X509 certificate in PEM format")
 	fs.StringVar(&cfg.Security.KeyPath, "key", "", "path of file that contains X509 key in PEM format")
 	fs.Uint64Var(&cfg.InitEpochVer, "epoch-ver", 1, "the initial epoch version value")
+	fs.IntVar(&cfg.HeartbeatRate, "heartbeat-rate", 0, "maximum global region heartbeats sent per second; 0 means unlimited")
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", "127.0.0.1:9090", "the address to pull metrics")
 
 	return cfg
@@ -154,6 +156,9 @@ func (c *Config) Adjust(meta *toml.MetaData) {
 
 // Validate is used to validate configurations
 func (c *Config) Validate() error {
+	if c.HeartbeatRate < 0 {
+		return errors.Errorf("heartbeat-rate can not be negative")
+	}
 	if c.HotStoreCount < 0 || c.HotStoreCount > c.StoreCount {
 		return errors.Errorf("hot-store-count must be in [0, store-count]")
 	}
