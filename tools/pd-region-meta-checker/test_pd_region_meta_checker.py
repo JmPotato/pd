@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import copy
+import importlib.util
 import json
 import subprocess
 import sys
@@ -11,10 +12,14 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import TCPServer
+from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 
 SCRIPT = Path(__file__).with_name("pd_region_meta_checker.py")
+SPEC = importlib.util.spec_from_file_location("pd_region_meta_checker", SCRIPT)
+CHECKER = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(CHECKER)
 
 
 def peer(peer_id, store_id):
@@ -50,6 +55,9 @@ class PDHandler(BaseHTTPRequestHandler):
             return self._json(self.server.members)
         if parsed.path.startswith("/pd/api/v1/region/id/"):
             self._record_local_request()
+            self.server.region_id_calls += 1
+            if self.server.region_id_hook:
+                self.server.region_id_hook(self.server.region_id_calls)
             region_id = int(parsed.path.rsplit("/", 1)[1])
             value = next(
                 (copy.deepcopy(item) for item in self.server.regions if item["id"] == region_id),
@@ -128,6 +136,8 @@ class FakePD:
         self.server.count_hook = None
         self.server.scan_calls = 0
         self.server.scan_hook = None
+        self.server.region_id_calls = 0
+        self.server.region_id_hook = None
         self.server.page_limit = None
         self.server.request_paths = []
         self.server.failure_path = None
@@ -229,6 +239,71 @@ class CheckerCLITest(unittest.TestCase):
                     for _, _, redirector in server.local_headers
                 )
             )
+
+    def test_scans_each_batch_on_all_pd_members_concurrently(self):
+        barrier = threading.Barrier(3)
+
+        def wait_for_same_batch(scan_calls):
+            if scan_calls != 1:
+                return
+            try:
+                barrier.wait(timeout=1)
+            except threading.BrokenBarrierError:
+                pass
+
+        for server in (self.leader.server, self.follower.server, self.follower_2.server):
+            server.scan_hook = wait_for_same_batch
+
+        result = self.run_checker()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(barrier.broken, "the first Region page was fetched serially")
+        settings = json.loads(result.stdout)["settings"]
+        self.assertEqual(settings["global_concurrency"], 3)
+        self.assertEqual(settings["per_node_concurrency"], 1)
+
+    def test_rechecks_each_region_on_all_pd_members_concurrently(self):
+        self.follower.server.regions[0]["epoch"]["version"] = 2
+        barrier = threading.Barrier(3)
+
+        def wait_for_same_region(region_id_calls):
+            if region_id_calls != 1:
+                return
+            try:
+                barrier.wait(timeout=1)
+            except threading.BrokenBarrierError:
+                pass
+
+        for server in (self.leader.server, self.follower.server, self.follower_2.server):
+            server.region_id_hook = wait_for_same_region
+
+        result = self.run_checker()
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(barrier.broken, "the Region confirmation was fetched serially")
+
+    def test_rate_limiter_charges_every_request_in_a_parallel_batch(self):
+        now = [0.0]
+        sleeps = []
+
+        def monotonic():
+            return now[0]
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        limiter = CHECKER.RateLimiter(0.05)
+        with mock.patch.object(CHECKER.time, "monotonic", monotonic), mock.patch.object(
+            CHECKER.time, "sleep", sleep
+        ):
+            limiter.wait(3)
+            now[0] = 0.01
+            limiter.wait(3)
+
+        self.assertEqual(len(sleeps), 1)
+        self.assertAlmostEqual(sleeps[0], 0.14)
+        self.assertAlmostEqual(limiter.next_request, 0.30)
 
     def test_writes_json_report_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -476,6 +551,21 @@ class CheckerCLITest(unittest.TestCase):
         self.assertIn("maximum runtime of 0.1s exceeded", result.stderr)
         self.assertLess(time.monotonic() - started, 1.0)
 
+    def test_hard_runtime_limit_interrupts_a_parallel_batch(self):
+        def delay_first_page(scan_calls):
+            if scan_calls == 1:
+                time.sleep(2)
+
+        for server in (self.leader.server, self.follower.server, self.follower_2.server):
+            server.scan_hook = delay_first_page
+        started = time.monotonic()
+
+        result = self.run_checker("--max-runtime", "0.1")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("maximum runtime of 0.1s exceeded", result.stderr)
+        self.assertLess(time.monotonic() - started, 1.0)
+
     def test_bounds_page_requests_when_api_returns_short_pages(self):
         self.leader.server.page_limit = 1
         result = self.run_checker()
@@ -627,14 +717,21 @@ class CheckerCLITest(unittest.TestCase):
             self.assertEqual(list(work_dir.iterdir()), [])
 
     def test_rechecks_transient_meta_differences(self):
-        def update_after_first_leader_page(scan_calls):
-            if scan_calls != 1:
-                return
-            self.leader.server.scan_hook = None
-            for server in (self.leader.server, self.follower.server, self.follower_2.server):
-                server.regions[0]["epoch"]["version"] = 2
+        self.follower.server.regions[0]["epoch"]["version"] = 2
 
-        self.leader.server.scan_hook = update_after_first_leader_page
+        def resolve_difference():
+            for server in (self.leader.server, self.follower.server, self.follower_2.server):
+                server.regions[0]["epoch"]["version"] = 1
+
+        barrier = threading.Barrier(3, action=resolve_difference)
+
+        def resolve_during_confirmation(region_id_calls):
+            if region_id_calls != 1:
+                return
+            barrier.wait(timeout=1)
+
+        for server in (self.leader.server, self.follower.server, self.follower_2.server):
+            server.region_id_hook = resolve_during_confirmation
         result = self.run_checker()
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)

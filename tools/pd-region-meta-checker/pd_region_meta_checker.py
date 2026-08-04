@@ -3,6 +3,7 @@
 
 import argparse
 import collections
+import concurrent.futures
 import contextlib
 import datetime
 import heapq
@@ -10,11 +11,13 @@ import http.client
 import json
 import math
 import os
+import queue
 import shutil
 import signal
 import ssl
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,12 +105,14 @@ class RateLimiter:
     def __init__(self, interval):
         self.interval = interval
         self.next_request = 0.0
+        self.lock = threading.Lock()
 
-    def wait(self):
-        now = time.monotonic()
-        if now < self.next_request:
-            time.sleep(self.next_request - now)
-        self.next_request = time.monotonic() + self.interval
+    def wait(self, cost=1):
+        with self.lock:
+            now = time.monotonic()
+            if now < self.next_request:
+                time.sleep(self.next_request - now)
+            self.next_request = time.monotonic() + self.interval * cost
 
 
 class TemporaryJSONBudget:
@@ -295,7 +300,7 @@ class HTTPClient:
             )
         return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
 
-    def get_json(self, path, params=None, local=False):
+    def get_json(self, path, params=None, local=False, reserved=False):
         target = path
         if params is not None:
             target += "?" + urlencode(params)
@@ -305,13 +310,15 @@ class HTTPClient:
 
         last_error = None
         for attempt in range(self.retries + 1):
-            self.limiter.wait()
+            if attempt > 0 or not reserved:
+                self.limiter.wait()
             try:
                 if self.connection is None:
                     self.connection = self._connect()
-                self.connection.request("GET", target, headers=headers)
+                connection = self.connection
+                connection.request("GET", target, headers=headers)
                 self.requests += 1
-                response = self.connection.getresponse()
+                response = connection.getresponse()
                 body = response.read(MAX_RESPONSE_BYTES + 1)
                 self.response_bytes += len(body)
                 status = response.status
@@ -341,6 +348,97 @@ class HTTPClient:
             if attempt < self.retries:
                 time.sleep(min(0.1 * (2**attempt), 1.0))
         raise last_error
+
+
+class DaemonExecutor:
+    def __init__(self, max_workers):
+        # ThreadPoolExecutor waits for blocked sockets at process exit, defeating --max-runtime.
+        self.tasks = queue.Queue()
+        self.threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"pd-region-meta-{index}",
+                daemon=True,
+            )
+            for index in range(max_workers)
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def _worker(self):
+        while True:
+            task = self.tasks.get()
+            if task is None:
+                return
+            future, function, args = task
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(function(*args))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+    def submit(self, function, *args):
+        future = concurrent.futures.Future()
+        self.tasks.put((future, function, args))
+        return future
+
+    def shutdown(self, wait):
+        for _ in self.threads:
+            self.tasks.put(None)
+        if wait:
+            for thread in self.threads:
+                thread.join()
+
+
+class BatchRequester:
+    def __init__(self, limiter, max_workers):
+        self.limiter = limiter
+        self.executor = DaemonExecutor(max_workers)
+        self.failed = False
+
+    def get_json(self, calls):
+        if not calls:
+            return []
+        clients = [call[0] for call in calls]
+        if len({id(client) for client in clients}) != len(clients):
+            raise CheckerError("a PD member cannot receive concurrent checker requests")
+
+        self.limiter.wait(len(calls))
+        if len(calls) == 1:
+            client, path, params, local = calls[0]
+            return [client.get_json(path, params, local, reserved=True)]
+
+        start = threading.Barrier(len(calls))
+
+        def request(call):
+            client, path, params, local = call
+            start.wait()
+            return client.get_json(path, params, local, reserved=True)
+
+        futures = [
+            self.executor.submit(request, call)
+            for call in calls
+        ]
+        try:
+            done, _ = concurrent.futures.wait(
+                futures, return_when=concurrent.futures.FIRST_EXCEPTION
+            )
+            for future in done:
+                error = future.exception()
+                if error is not None:
+                    raise error
+            return [future.result() for future in futures]
+        except BaseException:
+            self.failed = True
+            for client in clients:
+                client.close()
+            for future in futures:
+                future.cancel()
+            raise
+
+    def close(self):
+        self.executor.shutdown(wait=not self.failed)
 
 
 def now_utc():
@@ -481,8 +579,7 @@ def normalize_region(raw):
     return region_id, meta
 
 
-def get_region_count(client):
-    payload = client.get_json("/pd/api/v1/regions/count", local=True)
+def parse_region_count(payload):
     try:
         count = int(payload["count"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -492,12 +589,7 @@ def get_region_count(client):
     return count
 
 
-def get_region_page(client, cursor, batch_size):
-    payload = client.get_json(
-        "/pd/api/v1/regions/key",
-        params={"format": "hex", "key": cursor, "end_key": "", "limit": batch_size},
-        local=True,
-    )
+def parse_region_page(payload, batch_size):
     if not isinstance(payload, dict) or not isinstance(payload.get("regions"), list):
         raise CheckerError("/regions/key response does not contain a regions array")
     regions = payload["regions"]
@@ -521,12 +613,29 @@ class RegionStream:
         self.terminal_page = False
         self.max_pages = (state.count_before + batch_size - 1) // batch_size + 1
 
-    def _load_page(self):
+    @property
+    def needs_page(self):
+        return not self.buffer and not self.terminal_page
+
+    def page_request(self):
         if self.state.pages >= self.max_pages:
             raise CheckerError(
                 f"{self.state.node.name}: exceeded the bounded Region page count"
             )
-        page = get_region_page(self.client, self.state.cursor, self.batch_size)
+        return (
+            self.client,
+            "/pd/api/v1/regions/key",
+            {
+                "format": "hex",
+                "key": self.state.cursor,
+                "end_key": "",
+                "limit": self.batch_size,
+            },
+            True,
+        )
+
+    def accept_page(self, payload):
+        page = parse_region_page(payload, self.batch_size)
         self.state.pages += 1
         self.page_counter[0] += 1
         if self.page_counter[0] % 100 == 0:
@@ -567,8 +676,8 @@ class RegionStream:
             self.state.cursor = self.last_end_key
 
     def next_record(self):
-        if not self.buffer and not self.terminal_page:
-            self._load_page()
+        if self.needs_page:
+            raise CheckerError("internal Region page was not prefetched")
         if not self.buffer:
             self.state.done = True
             if not self.state.finished_at:
@@ -586,7 +695,14 @@ def boundary_order(value):
     return (1, b"") if value == "" else (0, bytes.fromhex(value))
 
 
-def scan_streams(states, clients, batch_size, differences):
+def prefetch_pages(streams, requester):
+    pending = [stream for stream in streams if stream.needs_page]
+    payloads = requester.get_json([stream.page_request() for stream in pending])
+    for stream, payload in zip(pending, payloads):
+        stream.accept_page(payload)
+
+
+def scan_streams(states, clients, batch_size, differences, requester):
     page_counter = [0]
     for state in states:
         state.started_at = now_utc()
@@ -596,6 +712,7 @@ def scan_streams(states, clients, batch_size, differences):
     ]
 
     while True:
+        prefetch_pages(streams, requester)
         records = [stream.next_record() for stream in streams]
         if all(record is None for record in records):
             return
@@ -611,9 +728,13 @@ def scan_streams(states, clients, batch_size, differences):
 
         while len(set(boundaries)) != 1:
             boundary = min(boundaries, key=boundary_order)
-            for node_index, current in enumerate(boundaries):
-                if current != boundary:
-                    continue
+            node_indexes = [
+                node_index
+                for node_index, current in enumerate(boundaries)
+                if current == boundary
+            ]
+            prefetch_pages([streams[node_index] for node_index in node_indexes], requester)
+            for node_index in node_indexes:
                 record = streams[node_index].next_record()
                 if record is None:
                     boundaries[node_index] = ""
@@ -622,16 +743,20 @@ def scan_streams(states, clients, batch_size, differences):
                     differences.add(record[0], node_index, record[1])
 
 
-def collect_regions(nodes, clients, batch_size, scan_retries, directory, budget):
+def collect_regions(nodes, clients, batch_size, scan_retries, directory, budget, requester):
     for attempt in range(1, scan_retries + 2):
         states = [ScanState(node=node, attempts=attempt) for node in nodes]
-        for state in states:
-            state.count_before = get_region_count(clients[state.node.index])
+        count_calls = [
+            (clients[state.node.index], "/pd/api/v1/regions/count", None, True)
+            for state in states
+        ]
+        for state, payload in zip(states, requester.get_json(count_calls)):
+            state.count_before = parse_region_count(payload)
         differences = SortedDifferences(directory, budget)
         try:
-            scan_streams(states, clients, batch_size, differences)
-            for state in states:
-                state.count_after = get_region_count(clients[state.node.index])
+            scan_streams(states, clients, batch_size, differences, requester)
+            for state, payload in zip(states, requester.get_json(count_calls)):
+                state.count_after = parse_region_count(payload)
         except BaseException:
             differences.cleanup()
             raise
@@ -776,7 +901,7 @@ def summarize(sorted_rows, nodes, confirmation_limit):
     return summary, confirmation_candidates
 
 
-def recheck_differences(initial, nodes, clients, difference_count, limit):
+def recheck_differences(initial, nodes, clients, difference_count, limit, requester):
     confirmation = {
         "initial_differences": difference_count,
         "limit": limit,
@@ -803,10 +928,16 @@ def recheck_differences(initial, nodes, clients, difference_count, limit):
     final = {}
     for region_id in region_ids:
         rows = [None] * len(nodes)
-        for node in nodes:
-            payload = clients[node.index].get_json(
-                f"/pd/api/v1/region/id/{region_id}", local=True
+        calls = [
+            (
+                clients[node.index],
+                f"/pd/api/v1/region/id/{region_id}",
+                None,
+                True,
             )
+            for node in nodes
+        ]
+        for node, payload in zip(nodes, requester.get_json(calls)):
             if payload is None:
                 continue
             if not isinstance(payload, dict):
@@ -1076,6 +1207,7 @@ def run(args):
         supplied[0], args.timeout, args.retries, limiter, ssl_context, authorization
     )
     clients = []
+    requester = None
     try:
         nodes, leader_id, cluster_id, membership_start = discover_nodes(seed, supplied)
         if authorization and any(urlsplit(node.url).scheme != "https" for node in nodes):
@@ -1084,6 +1216,7 @@ def run(args):
             HTTPClient(node.url, args.timeout, args.retries, limiter, ssl_context, authorization)
             for node in nodes
         ]
+        requester = BatchRequester(limiter, len(nodes))
         with tempfile.TemporaryDirectory(
             prefix="pd-region-meta-checker-", dir=work_root
         ) as directory:
@@ -1100,6 +1233,7 @@ def run(args):
                     args.scan_retries,
                     directory,
                     budget,
+                    requester,
                 )
                 initial_summary, initial = summarize(
                     sorted_rows, nodes, args.confirm_limit
@@ -1110,6 +1244,7 @@ def run(args):
                     clients,
                     initial_summary["different_regions"],
                     args.confirm_limit,
+                    requester,
                 )
                 membership_end = seed.get_json("/pd/api/v1/members", local=True)
                 if membership_signature(membership_start) != membership_signature(
@@ -1142,7 +1277,8 @@ def run(args):
                         "request_interval_seconds": args.interval,
                         "request_timeout_seconds": args.timeout,
                         "max_runtime_seconds": args.max_runtime,
-                        "global_concurrency": 1,
+                        "global_concurrency": len(nodes),
+                        "per_node_concurrency": 1,
                         "confirmation_limit": args.confirm_limit,
                         "temporary_disk_limit_mib": args.max_temporary_disk_mib,
                         "output_limit_mib": args.max_output_mib,
@@ -1152,7 +1288,7 @@ def run(args):
                         + sum(client.response_bytes for client in clients),
                         "temporary_disk_peak_bytes": budget.peak_bytes,
                         "snapshot_semantics": (
-                            "bounded round-robin scans; differences are rechecked, "
+                            "bounded parallel batch scans; differences are rechecked, "
                             "but the result is not an atomic snapshot"
                         ),
                     },
@@ -1189,6 +1325,8 @@ def run(args):
         seed.close()
         for client in clients:
             client.close()
+        if requester is not None:
+            requester.close()
 
 
 def main(argv=None):

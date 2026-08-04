@@ -1,6 +1,6 @@
 # PD region meta consistency checker
 
-`pd_region_meta_checker.py` 用于检查同一 PD 集群中 Leader 与各 Follower 本地缓存的 region meta 是否一致。脚本直接访问每个 PD 实例，以小批量、全局串行和限速方式扫描 Region，输出单个 JSON 报告。
+`pd_region_meta_checker.py` 用于检查同一 PD 集群中 Leader 与各 Follower 本地缓存的 region meta 是否一致。脚本直接访问每个 PD 实例，以小批量、同批跨实例并发、单实例串行和全局限速方式扫描 Region，输出单个 JSON 报告。
 
 该脚本以 [`v8.5.4-20260625-8b1b130`](https://github.com/tikv/pd/releases/tag/v8.5.4-20260625-8b1b130)（commit `8b1b1307f98e2286429d25e44133cd65541b1c63`）的 HTTP API 行为为基线。用于其他版本前，应确认成员发现、Region 扫描和 Follower 本地读取能力兼容。
 
@@ -8,21 +8,21 @@
 
 ## 快速执行
 
-脚本无需编译，也不需要安装 pip 依赖。本文验证和基准使用 commit `517fdc0c07bb6b4781be1682a83c52133e6ff709` 中的脚本，其 SHA-256 为：
+脚本无需编译，也不需要安装 pip 依赖。交付脚本的 SHA-256 为：
 
 ```text
-c74cd62865e0c46880f5df50d0684439573ff99f30b0a7d79df77b5e4f95cd07
+c7e55d335a2447237794be27eedebbe17ca3e3ca3bfd6cee7499cda982ffca10
 ```
 
 Linux 上执行以下命令验证脚本，只有输出 `OK` 时才继续：
 
 ```bash
 script=./tools/pd-region-meta-checker/pd_region_meta_checker.py
-expected_sha256=c74cd62865e0c46880f5df50d0684439573ff99f30b0a7d79df77b5e4f95cd07
+expected_sha256=c7e55d335a2447237794be27eedebbe17ca3e3ca3bfd6cee7499cda982ffca10
 printf '%s  %s\n' "$expected_sha256" "$script" | sha256sum -c -
 ```
 
-macOS 使用 `shasum -a 256 "$script"`，并确认输出值相同。校验失败时不要执行，应重新获取与上述 commit 对应的脚本。
+macOS 使用 `shasum -a 256 "$script"`，并确认输出值相同。校验失败时不要执行，应重新获取交付脚本。
 
 建议从独立运维机执行，并为每轮检查使用新的输出文件：
 
@@ -93,15 +93,15 @@ test ! -s "$report" || jq '{status, summary, confirmation, nodes}' "$report"
 
 ## 工作原理与结果边界
 
-1. 发现成员、PD Leader 和 cluster ID，创建指向每个 PD 实例的直接 HTTP 连接。
-2. 扫描前后分别读取每个实例的 Region 数，通过 `/pd/api/v1/regions/key` 按 Key Range 分页。
-3. 所有实例共享一个限速器，并发固定为 `1`，通过 round-robin 交错扫描；请求固定携带 `PD-Allow-Follower-Handle: true`、`PD-Redirector: pd-region-meta-checker` 和 `X-Caller-ID: pd-region-meta-checker`，直接读取目标实例的本地 Region cache，不产生 GetRegion 类 gRPC 请求。
-4. 按 Key Range 结束边界对齐各节点数据流。相同片段立即释放；只有差异片段进入有界临时 JSONL，按 Region ID 外部归并排序。
-5. 对 Region ID 最小的前 `--confirm-limit` 个差异等待 1 秒后再次读取，并在结束前确认 PD Leader、cluster ID 和成员身份没有变化。
+1. 发现成员、PD Leader 和 cluster ID，为每个 PD 实例建立独立 HTTP 连接。
+2. 同时读取各实例的 Region 数；随后通过 `/pd/api/v1/regions/key` 按 Key Range 分页，同一批请求在各 PD 上尽量同时开始。
+3. 每个实例最多存在一个在途请求。所有实例共享请求预算：一组包含 N 个请求时一次消耗 N 份预算，因此默认长期总速率仍不超过 20 requests/s。请求固定携带 `PD-Allow-Follower-Handle: true`、`PD-Redirector: pd-region-meta-checker` 和 `X-Caller-ID: pd-region-meta-checker`，直接读取目标实例的本地 Region cache，不产生 GetRegion 类 gRPC 请求。
+4. 主线程按 Key Range 结束边界对齐各节点数据流。相同片段立即释放；只有差异片段进入有界临时 JSONL，按 Region ID 外部归并排序。
+5. 对 Region ID 最小的前 `--confirm-limit` 个差异等待 1 秒后再次读取；同一 Region ID 也会同时向各实例确认。结束前再次确认 PD Leader、cluster ID 和成员身份没有变化。
 
 只有某节点的“扫描前数量、实际扫描数量、扫描后数量”相等，本轮扫描才会被接受。默认 `--scan-retries=0`，数量不稳定时立即失败，避免自动重扫放大负载。
 
-本工具提供的是受限交错扫描和差异二次确认，不是原子快照：
+跨实例并发缩短了同一批的采样时差，但多个独立 HTTP 请求无法构成分布式原子快照：
 
 - `consistent` 表示本轮观察没有留下差异，不等价于线性一致性证明。
 - `inconsistent` 表示至少一个已确认差异在两次读取中保持相同，是较强的不一致证据。
@@ -117,23 +117,23 @@ test ! -s "$report" || jq '{status, summary, confirmation, nodes}' "$report"
 ./tools/pd-region-meta-checker/pd_region_meta_checker.py --help
 ```
 
-| 参数 | 默认值 | 说明 |
+| 参数 | 默认值（含单位） | 说明 |
 | --- | ---: | --- |
 | `PD_URL [PD_URL ...]` | 必填 | 一个或多个 `http://`、`https://` 根 URL；不能包含用户名、密码、Path、Query 或 Fragment。 |
-| `--batch-size` | `128` | 每次最多读取的 Region 数，范围 `1..1024`。减小可降低单次峰值，但会增加请求数和运行时间。 |
-| `--interval` | `0.05` | 所有节点共享的请求起始间隔，必须为非负有限值；默认约束为全局最多 20 requests/s。 |
-| `--timeout` | `10` | 单个 HTTP 请求的 socket timeout，单位秒。 |
-| `--max-runtime` | `14400` | 整轮检查的 wall-clock 硬上限，单位秒；到期清理临时文件并退出 `2`。 |
-| `--retries` | `0` | 单请求额外重试次数，范围 `0..10`。默认不重试，避免在 PD 已有压力时放大请求。 |
-| `--scan-retries` | `0` | Region 数变化时的整集群重扫次数，范围 `0..3`。每次重试都会重新扫描全部节点。 |
-| `--confirm-limit` | `128` | 二次确认的差异 Region 上限，范围 `0..1024`；`0` 表示禁用确认。 |
-| `--work-dir` | 系统临时目录 | 临时差异文件和 stdout 临时报告所在目录，必须已经存在。 |
-| `--max-temporary-disk-mib` | `1024` | 差异排序与归并临时数据的硬上限。 |
-| `--max-output-mib` | `1024` | 最终 JSON 报告的硬上限。 |
-| `--output` | `-` | `-` 表示 stdout；指定路径时完整写入并 `fsync` 后原子替换目标文件。 |
-| `--cacert` | 系统 CA | HTTPS CA bundle。 |
-| `--cert`、`--key` | 无 | mTLS 客户端证书和私钥，必须同时提供。 |
-| `--authorization-file` | 无 | 包含一行完整 Authorization Header 值的文件；只能和 HTTPS 一起使用。 |
+| `--batch-size` | `128 Region/请求` | 每次最多读取的 Region 数，范围 `1..1024 Region/请求`。减小可降低单次峰值，但会增加请求数和运行时间。 |
+| `--interval` | `0.05 秒/请求` | 每份全局 HTTP 请求预算的间隔，必须为非负有限值；一组 N 个并发请求消耗 N 份预算，默认长期总速率不超过 20 requests/s。三实例同批请求的最小组间隔为 `3 × 0.05 = 0.15 秒`。 |
+| `--timeout` | `10 秒` | 单个 HTTP 请求的 socket timeout。 |
+| `--max-runtime` | `14400 秒（4 小时）` | 整轮检查的 wall-clock 硬上限；到期清理临时文件并退出 `2`。 |
+| `--retries` | `0 次` | 单请求额外重试次数，范围 `0..10 次`。默认不重试，避免在 PD 已有压力时放大请求。 |
+| `--scan-retries` | `0 次` | Region 数变化时的整集群重扫次数，范围 `0..3 次`。每次重试都会重新扫描全部节点。 |
+| `--confirm-limit` | `128 Region` | 二次确认的差异 Region 上限，范围 `0..1024 Region`；`0` 表示禁用确认。 |
+| `--work-dir` | 系统临时目录（路径） | 临时差异文件和 stdout 临时报告所在目录，必须已经存在。 |
+| `--max-temporary-disk-mib` | `1024 MiB` | 差异排序与归并临时数据的硬上限。 |
+| `--max-output-mib` | `1024 MiB` | 最终 JSON 报告的硬上限。 |
+| `--output` | `-`（stdout 或路径） | `-` 表示 stdout；指定路径时完整写入并 `fsync` 后原子替换目标文件。 |
+| `--cacert` | 系统 CA（路径） | HTTPS CA bundle。 |
+| `--cert`、`--key` | 未设置（路径） | mTLS 客户端证书和私钥，必须同时提供。 |
+| `--authorization-file` | 未设置（路径） | 包含一行完整 Authorization Header 值的文件；只能和 HTTPS 一起使用。 |
 
 `--interval 0` 只用于隔离测试，不能用于生产。不要为了缩短时间而提高 `--batch-size`、取消限速或首先启用 `--scan-retries`；这些操作会增大 PD 瞬时或累计负载。
 
@@ -278,8 +278,8 @@ jq '.confirmation.unconfirmed_regions // 0' region-meta-report.json
 
 | 资源 | 最低配置 | 建议配置 | 说明 |
 | --- | ---: | ---: | --- |
-| CPU | 1 vCPU | 2 vCPU | 全局并发固定为 `1`；额外 CPU 留给操作系统、TLS 和报告处理。 |
-| 内存 | 512 MiB | 1 GiB | 一致路径最大 RSS 为 23.13 MiB，113,627 个差异的样本为 43.45 MiB。 |
+| CPU | 1 vCPU | 2 vCPU | 网络读取最多与 PD 实例数相同，JSON 归一化与比较仍在主线程完成。 |
+| 内存 | 512 MiB | 1 GiB | 三实例会同时保留各自当前页的响应；容量取决于批量和单页内容，不随 Region 总数线性增长。 |
 | 可用磁盘 | 3 GiB | 5 GiB | 覆盖默认 1 GiB 临时数据、1 GiB 报告、既有报告和文件系统余量。 |
 | 网络 | 100 Mbps | 与 PD 同 VPC 或同可用区 | 必须直连所有 PD 地址；8,000,000 Region 的默认平均 Body 流量估算为 1.095 MiB/s。 |
 | 任务窗口 | 4 h | 大于 4 h | 默认硬上限为 4 h；8,000,000 Region 的默认限速时间下界约为 2 h 36 min。 |
@@ -298,31 +298,38 @@ jq '.confirmation.unconfirmed_regions // 0' region-meta-report.json
 
 在本次 8,000,000 Region、每 Region 3 Peer 的模型中，单个 PD RSS 约为 9.4–14.0 GiB。24 GiB 总内存且启动前至少 4 GiB `MemAvailable` 是同机运行的最低参考线，32 GiB 或更多更稳妥。Key 长度、Peer 数量、后台任务和业务负载都会改变该数字，不能用它代替等价环境容量验证。
 
-### 百万 Region 实测基线
+### 百万 Region API 工作量基线
 
-测试使用指定 PD commit、三个 PD、三个 Store、每 Region 三个 Peer；每个规模使用全新数据目录。执行环境为 AWS EC2 `r7i.4xlarge`（16 vCPU、123 GiB 可见内存、无 swap）、Ubuntu 22.04.5、Python 3.10.12 和 TiUP 1.17.0，脚本通过 loopback 访问 PD，测试期间没有业务负载。`--interval 0` 用于隔离环境压力基线，不代表生产参数。
+测试使用指定 PD commit、三个 PD、三个 Store、每 Region 三个 Peer；每个规模使用全新数据目录。执行环境为 AWS EC2 `r7i.4xlarge`（16 vCPU、123 GiB 可见内存、无 swap）、Ubuntu 22.04.5、Python 3.10.12 和 TiUP 1.17.0，脚本通过 loopback 访问 PD，测试期间没有业务负载。下表保留与并发调度无关的累计 API 工作量；实际时间还包含 PD 响应、JSON 处理和报告写入。
 
-| 每个 PD 的 Region 数 | HTTP 请求数 | `interval=0` Wall time | 脚本最大 RSS | Response Body | 默认限速时间下界 |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000,000 | 23,447 | 44.59 s | 22.63 MiB | 1.24 GiB | 19 min 32 s |
-| 2,000,000 | 46,883 | 89.44 s | 23.13 MiB | 2.48 GiB | 39 min 04 s |
-| 4,000,000 | 93,758 | 179.21 s | 23.00 MiB | 4.99 GiB | 1 h 18 min 08 s |
-| 8,000,000 | 187,508 | 359.54 s | 23.00 MiB | 10.02 GiB | 2 h 36 min 15 s |
+| 每个 PD 的 Region 数 | HTTP 请求数 | Response Body | 默认限速时间下界 |
+| ---: | ---: | ---: | ---: |
+| 1,000,000 | 23,447 | 1.24 GiB | 19 min 32 s |
+| 2,000,000 | 46,883 | 2.48 GiB | 39 min 04 s |
+| 4,000,000 | 93,758 | 4.99 GiB | 1 h 18 min 08 s |
+| 8,000,000 | 187,508 | 10.02 GiB | 2 h 36 min 15 s |
 
-8,000,000 Region 的 `interval=0` 压力基线约为 522 requests/s、28.55 MiB/s Response Body、三个 PD 合计 0.71 CPU core，并观察到三个 PD 的 Go runtime `sys` 合计增加 3.807 GiB。该模式不能用于生产，也不能用来推断默认限速下的内存变化。
+将累计工作量均匀摊入默认限速时间，8,000,000 Region 的三个 PD 合计平均 Body 流量估算为 1.095 MiB/s。默认并发不会减少 API 调用或 JSON 序列化总量，只会让同一批分散到不同 PD 上同时执行；单次请求的 JSON 序列化和短时 Region tree 读锁峰值仍然存在。
 
-将同一批 HTTP 和 CPU 工作量均匀摊入默认限速时间，估算三个 PD 合计平均 Body 流量为 1.095 MiB/s，PD CPU 合计约占一个 core 的 2.74%，检查器约占一个 core 的 2.67%。这些是容量规划参考，不是生产 SLA；单次扫描、JSON 序列化和短时读锁峰值不会因请求间休眠而消失。
+当前实现使用 Python 3.14.6 的本地生成数据基准如下；每个 Region 有三个 Peer，参数为 `batch-size=128`、`interval=0`：
 
-一致结果的报告约为 1.5 KiB，临时差异磁盘为 `0`。在 113,627 个 `missing_on` 差异样本中，报告为 9.11 MiB、检查器最大 RSS 为 43.45 MiB；实际报告大小取决于实例标识和差异字段内容。
+| 每个实例的 Region 数 | HTTP 请求数 | Wall time | 检查器最大 RSS | Response Body |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000,000 | 23,447 | 23.16 s | 34.38 MiB | 788.61 MiB |
+| 8,000,000 | 187,508 | 166.41 s | 34.31 MiB | 6.27 GiB |
+
+该基准只验证检查器的流式内存性质，不代表 PD 性能。`interval=0` 会放大隔离环境中的并发压力，生产吞吐由默认请求预算控制。
+
+一致结果的报告约为 1.5 KiB，临时差异磁盘为 `0`。差异报告大小取决于实例标识和不同字段内容，应使用默认磁盘与输出硬上限防止意外增长。
 
 ### 为什么 RSS 不随 Region 数增长
 
-`http_response_bytes` 是整轮所有 HTTP Response Body 的累计值，并不是同时驻留内存的数据量。脚本每次只读取一个受 8 MiB 硬上限保护的响应，每个 PD 最多保留当前一页 Region；相同片段比较后立即释放。
+`http_response_bytes` 是整轮所有 HTTP Response Body 的累计值，并不是同时驻留内存的数据量。每个 PD 最多有一个在途请求，每个响应受 8 MiB 硬上限保护；同一批的响应可以同时驻留，但相同片段比较后立即释放。
 
 差异路径只增加固定 8 MiB 排序缓冲，缓冲满后写入临时 JSONL，并通过 fan-in 为 8 的外部归并处理。二次确认最多保留 `--confirm-limit` 个候选，最终报告也逐条写入文件。因此内存复杂度近似为：
 
 ```text
-O(PD 节点数 × batch-size + 单个响应 + 固定差异缓冲 + confirm-limit)
+O(PD 节点数 × (batch-size + 单个响应) + 固定差异缓冲 + confirm-limit)
 ```
 
 而不是 `O(Region 总数)`。Region 数增加主要表现为请求数、累计网络流量和运行时间增加。
@@ -355,7 +362,7 @@ O(PD 节点数 × batch-size + 单个响应 + 固定差异缓冲 + confirm-limit
 
 ## 测试
 
-本地模拟 PD HTTP Server 的测试覆盖一致、Region 缺失、Key Range、Epoch、Peers、Region Leader Peer、Peer 顺序、瞬时差异、数量变化、Role、Witness、限速参数和 uint64 边界：
+本地模拟 PD HTTP Server 的测试覆盖一致、Region 缺失、Key Range、Epoch、Peers、Region Leader Peer、Peer 顺序、瞬时差异、数量变化、Role、Witness、同批并发、总请求预算、硬运行时限和 uint64 边界：
 
 ```bash
 python3 tools/pd-region-meta-checker/test_pd_region_meta_checker.py -v
