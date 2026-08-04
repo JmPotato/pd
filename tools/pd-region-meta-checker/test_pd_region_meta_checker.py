@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -93,12 +94,17 @@ class PDHandler(BaseHTTPRequestHandler):
         )
 
     def _json(self, value):
+        if self.server.response_delay:
+            time.sleep(self.server.response_delay)
         payload = json.dumps(value).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, *_args):
         pass
@@ -125,6 +131,7 @@ class FakePD:
         self.server.page_limit = None
         self.server.request_paths = []
         self.server.failure_path = None
+        self.server.response_delay = 0
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     @property
@@ -203,6 +210,7 @@ class CheckerCLITest(unittest.TestCase):
         self.assertEqual(report["summary"]["different_regions"], 0)
         self.assertEqual(report["reference"]["name"], "pd-leader")
         self.assertEqual(report["settings"]["http_requests"], 17)
+        self.assertEqual(report["settings"]["max_runtime_seconds"], 14400)
         self.assertGreater(report["settings"]["http_response_bytes"], 0)
         self.assertEqual(report["settings"]["temporary_disk_peak_bytes"], 0)
 
@@ -412,6 +420,24 @@ class CheckerCLITest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "consistent")
 
+    def test_reports_peer_role_and_witness_differences(self):
+        self.follower.server.regions[2]["peers"][0]["role"] = 1
+        self.follower_2.server.regions[2]["peers"][0]["is_witness"] = True
+        for server in (self.follower.server, self.follower_2.server):
+            server.regions[2]["leader"] = peer(30, 1)
+
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        difference = report["differences"][0]
+        self.assertEqual(set(difference), {"region_id", "peers"})
+        self.assertEqual(
+            difference["peers"][self.follower_instance][0]["role"], 1
+        )
+        self.assertTrue(
+            difference["peers"][self.follower_2_instance][0]["is_witness"]
+        )
+
     def test_rejects_unbounded_batch_size(self):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), self.leader.url, "--batch-size", "0"],
@@ -423,7 +449,11 @@ class CheckerCLITest(unittest.TestCase):
         self.assertIn("--batch-size must be in [1, 1024]", result.stderr)
 
     def test_rejects_non_finite_request_timing(self):
-        for flag, value in (("--interval", "nan"), ("--timeout", "inf")):
+        for flag, value in (
+            ("--interval", "nan"),
+            ("--timeout", "inf"),
+            ("--max-runtime", "nan"),
+        ):
             with self.subTest(flag=flag, value=value):
                 result = subprocess.run(
                     [sys.executable, str(SCRIPT), self.leader.url, flag, value],
@@ -435,6 +465,16 @@ class CheckerCLITest(unittest.TestCase):
                 self.assertIn(
                     "--interval must be finite and non-negative", result.stderr
                 )
+
+    def test_hard_runtime_limit_interrupts_a_slow_response(self):
+        self.leader.server.response_delay = 0.5
+        started = time.monotonic()
+
+        result = self.run_checker("--max-runtime", "0.1")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("maximum runtime of 0.1s exceeded", result.stderr)
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_bounds_page_requests_when_api_returns_short_pages(self):
         self.leader.server.page_limit = 1

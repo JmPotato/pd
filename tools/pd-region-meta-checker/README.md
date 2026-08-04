@@ -38,6 +38,7 @@
 ## 运行要求
 
 - Python 3.8 或更高版本。
+- Linux、macOS 等支持 POSIX interval timer 的系统；整轮硬超时依赖 `signal.setitimer`。
 - 不需要安装任何 pip 依赖。
 - 集群至少包含两个 PD 成员。
 - 执行脚本的机器必须能直连每个被使用的 PD `client_url`。
@@ -138,6 +139,7 @@ chmod 600 /secure/path/pd-authorization
 | `--batch-size` | `128` | 每次 `/regions/key` 请求最多读取的 Region 数，范围 `1..1024`。值越小，单次锁和响应越小，但请求总数与运行时间越长。 |
 | `--interval` | `0.05` | 任意两次 HTTP 请求之间的最小全局间隔，单位秒，必须大于等于 `0`。该间隔由所有节点共享，不是每节点各自限速。 |
 | `--timeout` | `10.0` | 单次 HTTP 请求的 socket timeout，单位秒，必须大于 `0`；不是整个检查的总超时。 |
+| `--max-runtime` | `14400` | 从开始发现成员到报告完整写出的整轮 wall-clock 硬上限，单位秒，必须大于 `0`。到期后中断当前请求、清理本轮临时文件并退出 `2`。 |
 | `--retries` | `0` | 单个 HTTP 请求的额外重试次数，范围 `0..10`。默认遇到网络错误或 HTTP `429/500/502/503/504` 立即失败，避免在 PD 已有压力时放大请求；只有确认环境有余量后才应显式启用重试。 |
 | `--scan-retries` | `0` | Region 数量不稳定时，额外进行的整集群重扫次数，范围 `0..3`。默认不自动重扫，避免请求量意外翻倍。 |
 | `--confirm-limit` | `128` | 最多二次确认的差异 Region 数，范围 `0..1024`，按 Region ID 升序选取。`0` 表示禁用确认，不表示无限制。 |
@@ -157,7 +159,7 @@ chmod 600 /secure/path/pd-authorization
 默认参数以降低峰值影响为优先，仅应在生产低峰期、从独立运维机运行：
 
 ```bash
---batch-size 128 --interval 0.05 --timeout 10 --retries 0 --scan-retries 0
+--batch-size 128 --interval 0.05 --timeout 10 --max-runtime 14400 --retries 0 --scan-retries 0
 ```
 
 如果集群负载较高，可以进一步降低单次压力，但运行时间会增加：
@@ -189,38 +191,44 @@ PD 成员数 × min(差异 Region 数, confirm-limit)
 ### 实测条件
 
 - PD 版本：`v8.5.4-20260625-8b1b130`，commit `8b1b1307f98e2286429d25e44133cd65541b1c63`。
-- 集群：TiUP Playground `v1.16.5` 启动 3 个 PD；Heartbeat Bench 注入 3 Store、每个 Region 3 Peer 的连续 Key Range。一致场景在注入结束且三个本地 `/regions/count` 完全相等后开始检查。
-- 执行机：Apple M4、24 GiB 物理内存、macOS、Python 3.14.6；脚本和 PD 之间使用 loopback。Heartbeat 注入阶段不计入脚本耗时。
+- 集群：TiUP Playground `v1.17.0` 启动 3 个 PD；Heartbeat Bench 注入 3 Store、每个 Region 3 Peer 的连续 Key Range。每个规模都使用全新的 PD 数据目录，在三个实例的本地 `/regions/count` 完全相等后停止 Heartbeat Bench，再开始检查。
+- 执行机：AWS EC2 `r7i.4xlarge`，16 vCPU、123 GiB 可见内存、无 swap，Ubuntu 22.04.5、Python 3.10.12；系统盘为 400 GiB gp3、6,000 IOPS、250 MiB/s。脚本和 PD 之间使用 loopback，Heartbeat 注入时间不计入脚本耗时。
 - 为隔离脚本自身固定工作量，表中使用 `--batch-size 128 --interval 0 --retries 0 --scan-retries 0`。`--interval 0` 不是生产参数。
-- Wall time、user/sys CPU 和最大 RSS 来自 macOS `/usr/bin/time -l`；PD CPU 是三个 PD 进程在检查窗口内 `process_cpu_seconds_total` 增量之和。测试集群没有业务负载，但后台任务仍计入 PD CPU，因此这些值不是生产 SLA。
+- Wall time、user/sys CPU 和最大 RSS 来自 GNU `/usr/bin/time -v`；PD CPU 是三个 PD 进程在检查窗口内 `process_cpu_seconds_total` 增量之和。测试集群没有业务负载，但后台任务仍计入 PD CPU，因此这些值不是生产 SLA。
 
 三个 PD 的 region meta 完全一致时，实测结果如下：
 
-| 每个 PD 的 Region 数 | HTTP 请求数 | Wall time | 脚本 user / sys CPU | 脚本最大 RSS | 三个 PD CPU 增量合计 | 一致报告大小 |
+| 每个 PD 的 Region 数 | 每节点批次数 | HTTP 请求数 | Wall time | 脚本 user / sys CPU | 脚本最大 RSS | 一致报告大小 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000,000 | 23,447 | 28.42 s | 23.00 / 0.76 s | 29.22 MiB | 10.08 s | 约 1.5 KiB |
-| 2,000,000 | 46,883 | 59.99 s | 46.25 / 1.53 s | 29.16 MiB | 24.36 s | 约 1.5 KiB |
-| 4,000,000 | 93,758 | 136.97 s | 95.17 / 3.28 s | 29.09 MiB | 64.32 s | 1,544 bytes |
+| 1,000,000 | 7,813 | 23,447 | 44.59 s | 30.99 / 1.15 s | 22.63 MiB | 约 1.5 KiB |
+| 2,000,000 | 15,625 | 46,883 | 89.44 s | 62.56 / 2.03 s | 23.13 MiB | 约 1.5 KiB |
+| 4,000,000 | 31,250 | 93,758 | 179.21 s | 125.62 / 3.75 s | 23.00 MiB | 约 1.5 KiB |
+| 8,000,000 | 62,500 | 187,508 | 359.54 s | 250.07 / 8.19 s | 23.00 MiB | 1,566 bytes |
 
-4,000,000 Region 一轮还记录到 5,360,681,468 bytes（4.99 GiB）的 HTTP Response Body。该数字不包含 HTTP Header、TCP、TLS，也会随 Peer 数量、实例地址和 region meta 内容变化。一致路径没有产生差异临时文件，`temporary_disk_peak_bytes=0`。
+一致路径的 HTTP 和 PD 侧观测如下。Response Body 不包含 HTTP Header、TCP、TLS；`go_memstats_sys_bytes` 是三个 PD 在检查前后的合计差值，不是峰值，也不能与业务并发场景直接等同：
 
-实际制造的稳定不一致场景中，PD Leader 有 4,000,000 个 Region，两个 Follower 各有 3,886,373 个，报告包含 113,627 个 `missing_on` 差异。脚本耗时 138.45 s，user/sys CPU 为 99.35/3.57 s，最大 RSS 为 43.45 MiB，JSON 报告为 9,547,423 bytes（9.11 MiB）；128 个差异完成二次确认，其余 113,499 个明确标为未确认。这个样本平均约 84 bytes/差异，但实例名称、地址和差异字段不同会显著改变单条大小，不能把该平均值当成通用容量公式。
+| 每个 PD 的 Region 数 | HTTP Response Body | 三个 PD CPU 增量合计 | 三个 PD `sys` 前后差值 | 三个 PD GC 次数增量 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000,000 | 1,331,423,157 bytes（1.24 GiB） | 16.35 s | +0.735 GiB | 2 |
+| 2,000,000 | 2,667,009,060 bytes（2.48 GiB） | 42.56 s | +1.798 GiB | 4 |
+| 4,000,000 | 5,360,680,938 bytes（4.99 GiB） | 96.10 s | +2.978 GiB | 6 |
+| 8,000,000 | 10,763,024,688 bytes（10.02 GiB） | 256.52 s | +3.807 GiB | 9 |
 
-### 8,000,000 Region 边界
+Wall time、请求数和 Response Body 随 Region 数近似线性增长；脚本最大 RSS 保持在 22.63–23.13 MiB，一致路径的 `temporary_disk_peak_bytes` 均为 `0`。8,000,000 Region 注入末段的 Heartbeat Bench RSS 采样约为 7.14 GiB，注入一轮耗时 22 min 52.74 s；检查开始前该进程已经停止。检查前后三个 PD 的 RSS 合计分别约为 32.78 GiB 和 35.77 GiB，8,000,000 Region 的 PD 数据目录约 1.3 GiB。
 
-24 GiB 测试机不能安全承载“8,000,000 Region × 3 份 PD cache + Heartbeat Bench 生成器”。在 4,000,000 Region 数据集上，三个 PD 暴露的 Go runtime 指标合计已经达到 16.87 GB `heap_alloc`、19.03 GB `heap_inuse` 和 24.15 GB `sys`；8,000,000 Region Heartbeat Bench 完成初始化后自身 RSS 约为 7.35 GB。真实 8,000,000 Region 注入在三个 PD 都达到 2,099,247 Region 时停止，没有产生可用于声明“8,000,000 Region 实测完成”的结果。
+`--interval 0` 在 8,000,000 Region 测试中形成约 522 HTTP requests/s、28.55 MiB/s Response Body 和三个 PD 合计约 0.71 CPU core 的持续压力，同时观察到 3.807 GiB 的 Go runtime `sys` 增长。这个模式只用于隔离环境压力基线，不能用于生产，也不能用它推断默认限速下的 PD 内存变化。
 
-为验证脚本而不是 PD cache 的容量，另用三个按请求即时生成 meta、且不保存 Region 的本地 HTTP fixture 完成了 8,000,000 Region 流式检查：共 187,508 个请求，`--interval 0` Wall time 175.24 s，脚本 user/sys CPU 106.80/3.87 s，最大 RSS 32.11 MiB，一致报告 1,451 bytes。fixture 返回的 Body 合计 6,732,021,610 bytes（6.27 GiB）。该测试只证明脚本的流式内存上界和完整遍历路径，不代表真实 PD 的 CPU、内存、序列化速度或网络开销。
+### 差异输出容量样本
 
-可以在隔离测试机复现这条流式路径；该命令会消耗显著的本机 CPU 和约 6 GiB loopback 流量，不应在 PD 主机上运行：
+在独立的本地 TiUP 故障注入测试中，PD Leader 有 4,000,000 个 Region，两个 Follower 各有 3,886,373 个，报告包含 113,627 个 `missing_on` 差异。脚本耗时 138.45 s，user/sys CPU 为 99.35/3.57 s，最大 RSS 为 43.45 MiB，JSON 报告为 9,547,423 bytes（9.11 MiB）；128 个差异完成二次确认，其余 113,499 个明确标为未确认。这个样本平均约 84 bytes/差异，但实例名称、地址和差异字段不同会显著改变单条大小，不能把该平均值当成通用容量公式。
+
+隔离测试机还可以使用按请求生成 region meta 的 fixture 检查脚本流式路径；该命令会消耗显著的本机 CPU 和 loopback 流量，不应在 PD 主机上运行：
 
 ```bash
 python3 tools/pd-region-meta-checker/benchmark_streaming.py 8000000
 ```
 
 benchmark 使用临时目录保存并校验报告，结束后只在 stdout 输出一行资源指标 JSON。它依赖 Unix `resource` 模块，适用于 Linux 和 macOS。
-
-因此，当前证据可以支持“脚本自身在 8,000,000 Region 下仍保持约 32 MiB RSS”，不能把任何 8,000,000 Region 的真实 PD CPU/内存数字标成实测。需要真实 8,000,000 Region PD 基线时，应在与生产规模相符、具有明确额外内存余量的隔离环境重测，不能在 24 GiB 主机上通过 swap 勉强完成。
 
 ### 默认限速下的时间和平均负载
 
@@ -239,13 +247,13 @@ benchmark 使用临时目录保存并校验报告，结束后只在 stdout 输�
 | 4,000,000 | 93,758 | 1 h 18 min 07.85 s |
 | 8,000,000 | 187,508 | 2 h 36 min 15.35 s |
 
-以 4,000,000 Region 的实测 Body 和 CPU 工作量均匀摊入默认时间下界，三个 PD 合计平均 Body 流量约为 1.09 MiB/s，即每个实例约 0.36 MiB/s；三个 PD 的 CPU 增量合计平均约占一个 CPU core 的 1.37%，脚本 user CPU 平均约占一个 core 的 2.03%。这些是同一隔离测试工作量的时间摊薄值，不是生产保证：单次 128 Region 的扫描、JSON 序列化和短时读锁峰值并不会因为请求间休眠而消失，生产 PD 的 Region 形状、GC、网络和并行业务也不同。
+以 8,000,000 Region 的实测 Body 和 CPU 工作量均匀摊入默认时间下界，三个 PD 合计平均 Body 流量约为 1.095 MiB/s，即每个实例约 0.365 MiB/s；三个 PD 的 CPU 增量合计平均约占一个 CPU core 的 2.74%，脚本 user CPU 平均约占一个 core 的 2.67%。这些只是同一隔离测试工作量的时间摊薄值，不是生产保证：单次 128 Region 的扫描、JSON 序列化和短时读锁峰值不会因为请求间休眠而消失，Go GC 与内存保留也不随请求间隔线性缩放，生产 PD 的 Region 形状、网络和并行业务同样不同。
 
-本轮没有得到可从后台噪声中可靠分离的 PD 瞬时 heap/GC 增量，也没有业务流量可用于测量 TSO、调度或 TiDB 请求尾延迟，因此当前证据不能证明“对生产无扰动”，也不能据此批准生产执行。代码路径能够证明的是：默认每次 `ScanRegions` 最多在 Region tree 读锁内收集 128 个 `RegionInfo` 指针，随后在锁外序列化完整响应；PD 的瞬时额外内存是 `O(batch + response)`，而不是 `O(Region 总数)`，但具体峰值必须在等价负载的隔离环境中测量。
+测试前后的 `heap_alloc`、`heap_inuse` 和 GC 快照会受到 GC 时点及后台任务影响，不能把它们的差值当成扫描的瞬时内存峰值。测试也没有业务流量可用于测量 TSO、调度或 TiDB 请求尾延迟，因此不能据此批准生产执行或声称“对生产无扰动”。代码路径能够证明的是：默认每次 `ScanRegions` 最多在 Region tree 读锁内收集 128 个 `RegionInfo` 指针，随后在锁外序列化完整响应；PD 的瞬时额外内存是 `O(batch + response)`，而不是 `O(Region 总数)`，但具体峰值必须在等价负载的隔离环境中测量。
 
 ### 内存、磁盘和输出上界
 
-- 一致路径实测最大 RSS 约 29–32 MiB，Region 总数从 1,000,000 增加到 8,000,000 时没有按总数增长；每次最多同时处理各实例的一个小批次。
+- 一致路径实测最大 RSS 为 22.63–23.13 MiB，Region 总数从 1,000,000 增加到 8,000,000 时没有按总数增长；每次最多同时处理各实例的一个小批次。
 - 差异路径额外使用固定 8 MiB 排序缓冲和有界归并文件。临时差异数据默认硬上限 1 GiB，最终 JSON 默认硬上限 1 GiB；两者位于不同阶段和可能不同文件系统，规划空间时应按最多约 2 GiB 加文件系统余量考虑。
 - 一致报告约 1.5 KiB。存在差异时，报告大小由差异 Region 数、实例标识长度以及 `key_range`、`epoch`、`peers`、`leader_peer` 的实际内容决定，而不是由集群总 Region 数直接决定。
 - 达到临时数据或输出上限时，脚本退出 `2`，自动清理本轮工作目录；使用 `--output` 时不会用半成品覆盖已有报告。若业务要求列出超过默认上限的全部差异，必须先在独立运维机上确认磁盘容量，再显式提高上限。
@@ -371,6 +379,7 @@ Peer `role` 使用 kvproto 的数值：
     "batch_size": 128,
     "request_interval_seconds": 0.05,
     "request_timeout_seconds": 10.0,
+    "max_runtime_seconds": 14400.0,
     "global_concurrency": 1,
     "confirmation_limit": 128,
     "temporary_disk_limit_mib": 1024,

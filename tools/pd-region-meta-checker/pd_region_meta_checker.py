@@ -3,6 +3,7 @@
 
 import argparse
 import collections
+import contextlib
 import datetime
 import heapq
 import http.client
@@ -10,6 +11,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import ssl
 import sys
 import tempfile
@@ -38,6 +40,7 @@ UINT64_MAX = (1 << 64) - 1
 CONFIRM_DELAY_SECONDS = 1.0
 SORT_BUFFER_BYTES = 8 * 1024 * 1024
 MERGE_FAN_IN = 8
+DEFAULT_MAX_RUNTIME_SECONDS = 4 * 60 * 60
 RegionFields = collections.namedtuple(
     "RegionFields", "start_key end_key conf_ver version peers leader"
 )
@@ -45,6 +48,23 @@ RegionFields = collections.namedtuple(
 
 class CheckerError(Exception):
     pass
+
+
+@contextlib.contextmanager
+def runtime_limit(seconds):
+    if not hasattr(signal, "setitimer") or not hasattr(signal, "SIGALRM"):
+        raise CheckerError("--max-runtime requires POSIX interval timers")
+
+    def expired(_signum, _frame):
+        raise CheckerError(f"maximum runtime of {seconds:g}s exceeded")
+
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 @dataclass
@@ -970,6 +990,12 @@ def parse_args(argv):
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--interval", type=float, default=0.05, help="seconds between requests")
     parser.add_argument("--timeout", type=float, default=10.0, help="per-request timeout")
+    parser.add_argument(
+        "--max-runtime",
+        type=float,
+        default=DEFAULT_MAX_RUNTIME_SECONDS,
+        help="hard wall-clock limit for the complete check in seconds",
+    )
     parser.add_argument("--retries", type=int, default=0, help="HTTP retries per request")
     parser.add_argument(
         "--scan-retries",
@@ -1015,10 +1041,12 @@ def parse_args(argv):
         or args.interval < 0
         or not math.isfinite(args.timeout)
         or args.timeout <= 0
+        or not math.isfinite(args.max_runtime)
+        or args.max_runtime <= 0
     ):
         parser.error(
             "--interval must be finite and non-negative and "
-            "--timeout must be finite and positive"
+            "--timeout and --max-runtime must be finite and positive"
         )
     if not 0 <= args.retries <= 10 or not 0 <= args.scan_retries <= 3:
         parser.error("--retries must be in [0, 10] and --scan-retries in [0, 3]")
@@ -1113,6 +1141,7 @@ def run(args):
                         "batch_size": args.batch_size,
                         "request_interval_seconds": args.interval,
                         "request_timeout_seconds": args.timeout,
+                        "max_runtime_seconds": args.max_runtime,
                         "global_concurrency": 1,
                         "confirmation_limit": args.confirm_limit,
                         "temporary_disk_limit_mib": args.max_temporary_disk_mib,
@@ -1164,7 +1193,9 @@ def run(args):
 
 def main(argv=None):
     try:
-        return run(parse_args(argv))
+        args = parse_args(argv)
+        with runtime_limit(args.max_runtime):
+            return run(args)
     except KeyboardInterrupt:
         return 130
     except MemoryError:

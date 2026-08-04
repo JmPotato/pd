@@ -386,6 +386,13 @@ func (rs *Regions) handleRegionHeartbeat(ctx context.Context, wg *sync.WaitGroup
 	log.Info("store finish one round region heartbeat", zap.Uint64("store-id", storeID), zap.Duration("cost-time", time.Since(start)), zap.Int("reported-region-count", len(regions)))
 }
 
+func newHeartbeatLimiter(heartbeatRate int) *rate.Limiter {
+	if heartbeatRate == 0 {
+		return nil
+	}
+	return rate.NewLimiter(rate.Limit(heartbeatRate), 1)
+}
+
 // Stores contains store stats with lock.
 type Stores struct {
 	stat []atomic.Value
@@ -537,10 +544,7 @@ func main() {
 	resolvedTSTicker := time.NewTicker(time.Second)
 	defer resolvedTSTicker.Stop()
 	withMetric := metrics.InitMetric2Collect(cfg.MetricsAddr)
-	var heartbeatLimiter *rate.Limiter
-	if cfg.HeartbeatRate > 0 {
-		heartbeatLimiter = rate.NewLimiter(rate.Limit(cfg.HeartbeatRate), 1)
-	}
+	heartbeatLimiter := newHeartbeatLimiter(cfg.HeartbeatRate)
 	for {
 		select {
 		case <-heartbeatTicker.C:
