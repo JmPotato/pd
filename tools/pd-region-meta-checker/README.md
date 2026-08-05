@@ -296,7 +296,7 @@ jq '.confirmation.unconfirmed_regions // 0' region-meta-report.json
 
 必须同机时，除 PD 原有容量外，至少预留一个空闲逻辑 CPU、512 MiB `MemAvailable` 和 3 GiB 可用磁盘，并尽量让 `--work-dir` 和输出目录避开 PD 数据盘。
 
-在本次 8,000,000 Region、每 Region 3 Peer 的模型中，单个 PD RSS 约为 9.4–14.0 GiB。24 GiB 总内存且启动前至少 4 GiB `MemAvailable` 是同机运行的最低参考线，32 GiB 或更多更稳妥。Key 长度、Peer 数量、后台任务和业务负载都会改变该数字，不能用它代替等价环境容量验证。
+在本次 8,000,000 Region、每 Region 3 Peer 的模型中，扫描前单个 PD RSS 约为 9.5–13.8 GiB，扫描后约为 10.9–15.1 GiB。24 GiB 总内存且启动前至少 4 GiB `MemAvailable` 是同机运行的最低参考线，32 GiB 或更多更稳妥。Key 长度、Peer 数量、后台任务和业务负载都会改变该数字，不能用它代替等价环境容量验证。
 
 ### 百万 Region API 工作量基线
 
@@ -311,16 +311,18 @@ jq '.confirmation.unconfirmed_regions // 0' region-meta-report.json
 
 将累计工作量均匀摊入默认限速时间，8,000,000 Region 的三个 PD 合计平均 Body 流量估算为 1.095 MiB/s。默认并发不会减少 API 调用或 JSON 序列化总量，只会让同一批分散到不同 PD 上同时执行；单次请求的 JSON 序列化和短时 Region tree 读锁峰值仍然存在。
 
-当前实现使用 Python 3.14.6 的本地生成数据基准如下；每个 Region 有三个 Peer，参数为 `batch-size=128`、`interval=0`：
+同一 EC2 环境中的完整实测使用 `batch-size=128`、`interval=0`、全局并发 3、单节点并发 1，并在灌入停止、Region Syncer 索引收敛后执行：
 
-| 每个实例的 Region 数 | HTTP 请求数 | Wall time | 检查器最大 RSS | Response Body |
-| ---: | ---: | ---: | ---: | ---: |
-| 1,000,000 | 23,447 | 23.16 s | 34.38 MiB | 788.61 MiB |
-| 8,000,000 | 187,508 | 166.41 s | 34.31 MiB | 6.27 GiB |
+| 每个 PD 的 Region 数 | 结果 | Wall time | 检查器最大 RSS | 三台 PD CPU 增量合计 |
+| ---: | --- | ---: | ---: | ---: |
+| 1,000,000 | `consistent` | 42.290 s | 24.75 MiB | 16.96 s |
+| 2,000,000 | `consistent` | 84.378 s | 25.00 MiB | 39.80 s |
+| 4,000,000 | `consistent` | 168.691 s | 24.88 MiB | 80.79 s |
+| 8,000,000 | `consistent` | 336.250 s | 25.00 MiB | 232.11 s |
 
-该基准只验证检查器的流式内存性质，不代表 PD 性能。`interval=0` 会放大隔离环境中的并发压力，生产吞吐由默认请求预算控制。
+四档测试中，三个 PD 的 Region 数均精确等于目标值，每个节点只扫描一次，没有请求重试或整集群重扫；`differences` 为空，临时差异磁盘为 `0`，一致结果报告为 1,590–1,595 bytes。`interval=0` 只用于隔离环境下测量无主动限速时的压力，不代表生产运行时间；生产吞吐和时间下界由默认全局请求预算控制。
 
-一致结果的报告约为 1.5 KiB，临时差异磁盘为 `0`。差异报告大小取决于实例标识和不同字段内容，应使用默认磁盘与输出硬上限防止意外增长。
+差异报告大小取决于实例标识和不同字段内容，应使用默认磁盘与输出硬上限防止意外增长。
 
 ### 为什么 RSS 不随 Region 数增长
 
