@@ -1,0 +1,35 @@
+{
+  "checked_at": 1789906608.524969,
+  "checks": [
+    {
+      "repo": "pd",
+      "baseline": "06d2961669ddff4fbff6df5030c80feb08d18a7a",
+      "unchanged_since_panel_acceptance": true
+    },
+    {
+      "repo": "kvproto",
+      "baseline": "d80b6c5e7821b55f78092caead501ab0f00102da",
+      "unchanged_since_panel_acceptance": true
+    },
+    {
+      "repo": "tidb",
+      "baseline": "42024d2f62f38820c652acf850227e1c45eed160",
+      "unchanged_since_panel_acceptance": true
+    },
+    {
+      "process": "pd",
+      "pid": 187363,
+      "binary_sha256": "ddaad017cd340e1092ebbead1cba6d84f9d54b06f4be9ae57fa415867b22427f"
+    },
+    {
+      "process": "tidb-a",
+      "pid": 172825,
+      "binary_sha256": "16695d4d88a3f9b32f531ff3904904adf314d0b7e216c221d4f682782782c543"
+    },
+    {
+      "process": "tidb-b",
+      "pid": 173037,
+      "binary_sha256": "16695d4d88a3f9b32f531ff3904904adf314d0b7e216c221d4f682782782c543"
+    }
+  ]
+}

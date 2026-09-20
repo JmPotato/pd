@@ -1,0 +1,137 @@
+{
+  "group": "audit_live_compare",
+  "start": 1789906560,
+  "end": 1789906860,
+  "accounting_events": {
+    "a": 6860,
+    "b": 5284
+  },
+  "accounting_phases": {
+    "request": 6072,
+    "response_wait": 6072
+  },
+  "minute_samples": 5,
+  "all_checks_passed": true,
+  "max_absolute_error": 7.503331289626658e-12,
+  "max_relative_error": 7.171048438392994e-15,
+  "grafana_matching_samples": 5,
+  "direct_exporter_finalized_values_immutable": true,
+  "collector_errors": [],
+  "random_burst_modes": {
+    "read_write": 1,
+    "offset": 5,
+    "single": 1
+  },
+  "checks": [
+    {
+      "minute_end": 1789906620,
+      "peak_second": 1789906593,
+      "reference_ru_per_second": 578.5997257447917,
+      "metric_ru_per_second": 578.599725744791,
+      "reference_rru": 8.649725744791667,
+      "reference_wru": 569.95,
+      "metric_rru": 8.649725744791667,
+      "metric_wru": 569.9499999999994,
+      "metric_peak_second": 1789906593.0,
+      "available": 1.0,
+      "absolute_error": 6.821210263296962e-13,
+      "relative_error": 1.1789169541199637e-15,
+      "minute_mean_ru_per_second": 31.104285602864586,
+      "node_contributions_at_peak": {
+        "a": 4.3116245390625,
+        "b": 574.2881012057292
+      },
+      "sum_of_separate_client_peaks": 1013.7082883958333,
+      "pass_check": true,
+      "exporter_first_seen_delay_seconds": 30.810542106628418
+    },
+    {
+      "minute_end": 1789906680,
+      "peak_second": 1789906626,
+      "reference_ru_per_second": 1100.5372544114582,
+      "metric_ru_per_second": 1100.5372544114634,
+      "reference_rru": 1100.5372544114582,
+      "reference_wru": 0.0,
+      "metric_rru": 1100.5372544114634,
+      "metric_wru": 0.0,
+      "metric_peak_second": 1789906626.0,
+      "available": 1.0,
+      "absolute_error": 5.229594535194337e-12,
+      "relative_error": 4.751855981459713e-15,
+      "minute_mean_ru_per_second": 62.38790807799479,
+      "node_contributions_at_peak": {
+        "a": 1096.0886518723958,
+        "b": 4.4486025390625
+      },
+      "sum_of_separate_client_peaks": 2192.1383877447915,
+      "pass_check": true,
+      "exporter_first_seen_delay_seconds": 30.481475353240967
+    },
+    {
+      "minute_end": 1789906740,
+      "peak_second": 1789906699,
+      "reference_ru_per_second": 844.283082734375,
+      "metric_ru_per_second": 844.2830827343804,
+      "reference_rru": 844.283082734375,
+      "reference_wru": 0.0,
+      "metric_rru": 844.2830827343804,
+      "metric_wru": 0.0,
+      "metric_peak_second": 1789906699.0,
+      "available": 1.0,
+      "absolute_error": 5.4569682106375694e-12,
+      "relative_error": 6.4634342701314315e-15,
+      "minute_mean_ru_per_second": 36.576641099999996,
+      "node_contributions_at_peak": {
+        "a": 839.9809125286458,
+        "b": 4.302170205729166
+      },
+      "sum_of_separate_client_peaks": 1679.5850900572916,
+      "pass_check": true,
+      "exporter_first_seen_delay_seconds": 30.672502040863037
+    },
+    {
+      "minute_end": 1789906800,
+      "peak_second": 1789906759,
+      "reference_ru_per_second": 1046.3367182760417,
+      "metric_ru_per_second": 1046.3367182760492,
+      "reference_rru": 1046.3367182760417,
+      "reference_wru": 0.0,
+      "metric_rru": 1046.3367182760492,
+      "metric_wru": 0.0,
+      "metric_peak_second": 1789906759.0,
+      "available": 1.0,
+      "absolute_error": 7.503331289626658e-12,
+      "relative_error": 7.171048438392994e-15,
+      "minute_mean_ru_per_second": 43.28167545138889,
+      "node_contributions_at_peak": {
+        "a": 4.3165105390625,
+        "b": 1042.020207736979
+      },
+      "sum_of_separate_client_peaks": 2083.7641338072917,
+      "pass_check": true,
+      "exporter_first_seen_delay_seconds": 30.35184597969055
+    },
+    {
+      "minute_end": 1789906860,
+      "peak_second": 1789906855,
+      "reference_ru_per_second": 1329.0341931875,
+      "metric_ru_per_second": 1329.0341931874948,
+      "reference_rru": 1329.0341931875,
+      "reference_wru": 0.0,
+      "metric_rru": 1329.0341931874948,
+      "metric_wru": 0.0,
+      "metric_peak_second": 1789906855.0,
+      "available": 1.0,
+      "absolute_error": 5.229594535194337e-12,
+      "relative_error": 3.934883362670976e-15,
+      "minute_mean_ru_per_second": 43.79273453650173,
+      "node_contributions_at_peak": {
+        "a": 1324.6977349817707,
+        "b": 4.3364582057291665
+      },
+      "sum_of_separate_client_peaks": 1329.1404031875,
+      "pass_check": true,
+      "exporter_first_seen_delay_seconds": 30.515889644622803
+    }
+  ]
+}
