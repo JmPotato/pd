@@ -1,0 +1,70 @@
+{
+  "group": "audit_pr_compare",
+  "start": 1789909620,
+  "end": 1789909740,
+  "accounting_events": {
+    "a": 1710,
+    "b": 3534
+  },
+  "accounting_phases": {
+    "request": 2622,
+    "response_wait": 2622
+  },
+  "minute_samples": 2,
+  "all_checks_passed": true,
+  "max_absolute_error": 2.114575181622058e-11,
+  "max_relative_error": 1.283728123477286e-14,
+  "grafana_matching_samples": 2,
+  "direct_exporter_finalized_values_immutable": true,
+  "collector_errors": [],
+  "random_burst_modes": {
+    "read_write": 2,
+    "offset": 1
+  },
+  "checks": [
+    {
+      "minute_end": 1789909680,
+      "peak_second": 1789909625,
+      "reference_ru_per_second": 1647.2141904114583,
+      "metric_ru_per_second": 1647.2141904114794,
+      "reference_rru": 8.607940411458333,
+      "reference_wru": 1638.60625,
+      "metric_rru": 8.607940411458333,
+      "metric_wru": 1638.6062500000212,
+      "metric_peak_second": 1789909625.0,
+      "available": 1.0,
+      "absolute_error": 2.114575181622058e-11,
+      "relative_error": 1.283728123477286e-14,
+      "minute_mean_ru_per_second": 52.615335874175344,
+      "node_contributions_at_peak": {
+        "a": 4.3049352057291665,
+        "b": 1642.9092552057293
+      },
+      "sum_of_separate_client_peaks": 1971.1611783802084,
+      "pass_check": true,
+      "exporter_first_seen_delay_seconds": 30.464925527572632
+    },
+    {
+      "minute_end": 1789909740,
+      "peak_second": 1789909689,
+      "reference_ru_per_second": 1095.1532812447917,
+      "metric_ru_per_second": 1095.1532812448015,
+      "reference_rru": 8.686093744791666,
+      "reference_wru": 1086.4671875000001,
+      "metric_rru": 8.686093744791666,
+      "metric_wru": 1086.46718750001,
+      "metric_peak_second": 1789909689.0,
+      "available": 1.0,
+      "absolute_error": 9.777068044058979e-12,
+      "relative_error": 8.927579555754972e-15,
+      "minute_mean_ru_per_second": 43.30673970972222,
+      "node_contributions_at_peak": {
+        "a": 4.3746365390625,
+        "b": 1090.7786447057292
+      },
+      "sum_of_separate_client_peaks": 1615.14663534375,
+      "pass_check": true,
+      "exporter_first_seen_delay_seconds": 30.606786489486694
+    }
+  ]
+}

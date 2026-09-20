@@ -1,0 +1,41 @@
+{
+  "created_at": 1789909549.2424026,
+  "repositories": {
+    "pd": {
+      "head": "64efe953823230a8732eabc6499b02a8e30b5914"
+    },
+    "kvproto": {
+      "head": "2a45fb4cd2dc77837ab4d068e7136f6d624e97d2"
+    },
+    "tidb": {
+      "head": "943f0e3859ab5e18622859a56d0759acb9104496"
+    }
+  },
+  "processes": [
+    {
+      "name": "pd",
+      "pid": 528493,
+      "binary_sha256": "4dc24e2029c7be74d83ae3a3dfff80a5a713fec18638215530f70c20e083f747"
+    },
+    {
+      "name": "tidb-system",
+      "binary_sha256": "2e915ae437145a683e22b3c2965ba46d1073cf511e03741662e7bdb6fc68fe07",
+      "pid": 478382
+    },
+    {
+      "name": "tidb-a",
+      "binary_sha256": "2e915ae437145a683e22b3c2965ba46d1073cf511e03741662e7bdb6fc68fe07",
+      "pid": 478391
+    },
+    {
+      "name": "tidb-b",
+      "binary_sha256": "2e915ae437145a683e22b3c2965ba46d1073cf511e03741662e7bdb6fc68fe07",
+      "pid": 478402
+    }
+  ],
+  "audit_scope": "Three test-only logging hooks at confirmed accounting boundaries; producer code copied byte-for-byte from the checksum-verified remote client module. No instrumentation in production commits.",
+  "audit-overlay.json_sha256": "5760022c50c28d098446af8a27bf57763b5d2716da5025ada621d2e86e059f62",
+  "group_controller.audit.go_sha256": "3c244131a838589a9cb8fa70dad1aaea76aaf392cd61f5865f493c198665c53b",
+  "ru_accounting_audit.go_sha256": "62c20b721cfe54166bb1ca6c05aecfd7da34535d2b05486a5b9970ba155f75bf",
+  "note": "TiDB and its client module are unchanged; PD metrics lifecycle handoff fix is deployed. Original audit build overlay is preserved as submission-runtime/audit-overlay.build.json."
+}
