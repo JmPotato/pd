@@ -4,7 +4,21 @@ This branch contains test artifacts only. It is not part of the production PD pu
 
 Related work: [PD #11256](https://github.com/tikv/pd/issues/11256), [KVProto #1539](https://github.com/pingcap/kvproto/pull/1539), [TiDB #71407](https://github.com/pingcap/tidb/issues/71407).
 
-## Final submitted implementation
+## Dashboard on the final implementation (2026-09-28)
+
+A local NextGen cluster ran PD `182d5ca685` (tikv/pd#11293), TiDB built against PD client `11761f7521` (tikv/pd#11304) plus the idle-cleanup fix from tikv/pd#11308, a TiKV CSE store, Prometheus 3.14 and 2.55 scraping the same targets, and Grafana 13.2.2 with the Resource Control dashboard from TiDB `5dd5b26295` (pingcap/tidb#71408). [`load.py`](grafana-2026-09-28/load.py) drove four resource groups: `rg_oltp` steady on both TiDB nodes, `rg_batch` write bursts every three minutes on TiDB-a only, `rg_report` scan bursts starting in the same second on both nodes, and `rg_etl` scan bursts offset by 4–10 seconds between the nodes.
+
+TiDB-b was killed with SIGKILL at 08:25:17 UTC and was ready again at 08:25:33. The minutes ending 08:26–08:29 have no sample for the groups it served, and `rg_batch`, served only by TiDB-a, continues. No other minute is missing from 08:12 to 08:46, no controller was recreated after 08:09, and the conflict, invalid-payload, missing-payload and capacity counters stayed at 0.
+
+![RU Max - 1s](grafana-2026-09-28/ru-max-1s.png)
+
+The panel sits beside RU, which shows average rates: `rg_batch` averages about 27 RU/s while its busiest seconds reach 4.74K RU/s.
+
+![Resource Unit row](grafana-2026-09-28/resource-unit-row.png)
+
+The panel query shifts the range one second forward, `max_over_time(peak[$__interval] offset -1s) and count_over_time(peak[$__interval] offset -1s) == $__interval_ms / 60000`, so that it covers exactly the minutes ending in (t - interval, t]. [`check_query.py`](grafana-2026-09-28/check_query.py) compares it point by point with the raw samples: no mismatch on Prometheus 3.14 or 2.55 at one- and two-minute steps, while an unshifted `[$__interval]` range picks up the previous minute on 2.55 ([results](grafana-2026-09-28/query-check-final.txt)).
+
+## Earlier submitted implementation (2026-09-20)
 
 After the final PD leadership-handoff fix, the cluster ran PD `64efe953823230a8732eabc6499b02a8e30b5914`, KVProto `2a45fb4cd2dc77837ab4d068e7136f6d624e97d2`, and the TiDB source at `943f0e3859ab5e18622859a56d0759acb9104496`. TiDB uses a byte-identical copy of its checksum-verified PD client plus three test-only logging hooks. The server-only handoff fix does not change that client module. Production builds contain no audit hooks.
 
