@@ -1,4 +1,4 @@
 prometheus 3.14 step=60s: 165 points, dashboard query mismatches=0, naive [60s] mismatches on complete intervals=0
 prometheus 3.14 step=120s: 85 points, dashboard query mismatches=0, naive [120s] mismatches on complete intervals=0
-prometheus 2.55 step=60s: 165 points, dashboard query mismatches=0, naive [60s] mismatches on complete intervals=67
-prometheus 2.55 step=120s: 85 points, dashboard query mismatches=0, naive [120s] mismatches on complete intervals=17
+prometheus 2.55 step=60s: 165 points, dashboard query mismatches=0, naive [60s] mismatches on complete intervals=60
+prometheus 2.55 step=120s: 85 points, dashboard query mismatches=0, naive [120s] mismatches on complete intervals=15
