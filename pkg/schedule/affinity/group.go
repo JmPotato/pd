@@ -83,6 +83,16 @@ const (
 // numbers (0-9), hyphens (-), and underscores (_).
 var idRegexp = regexp.MustCompile("^[-A-Za-z0-9_]{1,64}$")
 
+// LeaderSourceExplicit indicates that the effective peer distribution was set
+// explicitly via the peers-update API. Explicit targets are preserved across
+// restarts, degraded periods, and store outages.
+const LeaderSourceExplicit = "explicit"
+
+// LeaderSourceFallback indicates that the effective peer distribution was
+// derived from a first-win Region observation (a fresh group without a target,
+// or an expired group whose explicit-target stores were unavailable).
+const LeaderSourceFallback = "fallback"
+
 // Group defines an affinity group. Regions belonging to it will tend to have the same distribution.
 // NOTE: This type is exported by HTTP API and persisted in storage. Please pay more attention when modifying it.
 type Group struct {
@@ -91,12 +101,41 @@ type Group struct {
 	// CreateTimestamp is the time when the Group was created.
 	CreateTimestamp uint64 `json:"create_timestamp"`
 
-	// The following parameters are all determined automatically.
+	// The effective (currently enforced) peer distribution. It equals the
+	// explicit target when one exists and is viable; otherwise it may be the
+	// result of a first-win observation (see LeaderSource).
 
 	// LeaderStoreID indicates which store the leader should be on.
 	LeaderStoreID uint64 `json:"leader_store_id,omitempty"`
 	// VoterStoreIDs indicates which stores Voters should be on.
 	VoterStoreIDs []uint64 `json:"voter_store_ids,omitempty"`
+	// LeaderSource indicates how the effective distribution was determined:
+	// LeaderSourceExplicit (set via the peers-update API) or
+	// LeaderSourceFallback (derived from a first-win Region observation).
+	// Empty means no distribution has been determined yet.
+	LeaderSource string `json:"leader_source,omitempty"`
+
+	// The explicit peer distribution set via the peers-update API. It is kept
+	// even while a fallback distribution is in effect, so the group returns to
+	// it once the explicit-target stores recover.
+	ExplicitLeaderStoreID uint64   `json:"explicit_leader_store_id,omitempty"`
+	ExplicitVoterStoreIDs []uint64 `json:"explicit_voter_store_ids,omitempty"`
+}
+
+// hasExplicitTarget indicates whether the Group has an explicit peer target.
+func (g *Group) hasExplicitTarget() bool {
+	return g.ExplicitLeaderStoreID != 0 && len(g.ExplicitVoterStoreIDs) != 0
+}
+
+// normalizeLeaderSource migrates groups persisted before leader-source
+// tracking: an existing distribution without a source marker is treated as an
+// explicit target so that restarts and degraded periods preserve it.
+func (g *Group) normalizeLeaderSource() {
+	if g.LeaderSource == "" && g.LeaderStoreID != 0 && len(g.VoterStoreIDs) != 0 {
+		g.LeaderSource = LeaderSourceExplicit
+		g.ExplicitLeaderStoreID = g.LeaderStoreID
+		g.ExplicitVoterStoreIDs = slices.Clone(g.VoterStoreIDs)
+	}
 }
 
 func (g *Group) String() string {
@@ -189,10 +228,13 @@ func newGroupState(g *runtimeGroupInfo) *GroupState {
 
 	return &GroupState{
 		Group: Group{
-			ID:              g.ID,
-			CreateTimestamp: g.CreateTimestamp,
-			LeaderStoreID:   g.LeaderStoreID,
-			VoterStoreIDs:   slices.Clone(g.VoterStoreIDs),
+			ID:                    g.ID,
+			CreateTimestamp:       g.CreateTimestamp,
+			LeaderStoreID:         g.LeaderStoreID,
+			VoterStoreIDs:         slices.Clone(g.VoterStoreIDs),
+			LeaderSource:          g.LeaderSource,
+			ExplicitLeaderStoreID: g.ExplicitLeaderStoreID,
+			ExplicitVoterStoreIDs: slices.Clone(g.ExplicitVoterStoreIDs),
 		},
 		RegularSchedulingAllowed:  g.IsRegularSchedulingAllowed(),
 		AffinitySchedulingAllowed: affinitySchedulingAllowed,

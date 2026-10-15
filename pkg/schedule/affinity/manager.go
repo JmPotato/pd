@@ -71,6 +71,11 @@ type Manager struct {
 	groups              map[string]*runtimeGroupInfo // {group_id} -> runtimeGroupInfo
 	regions             map[uint64]regionCache       // {region_id} -> regionCache
 	unavailableStores   map[uint64]storeCondition    // {store_id} -> storeCondition
+	// availabilityChecked tracks whether checkGroupsAvailability has run at
+	// least once. The first run must be treated as a change even when the
+	// unavailable-store set is empty, otherwise groups loaded as degraded
+	// (e.g. after a restart) would never be re-evaluated.
+	availabilityChecked bool
 
 	// The following members are protected by metaMutex only, not protected by RWMutex.
 	// keyRanges cached in memory to reduce labeler lock contention
@@ -152,10 +157,13 @@ func (m *Manager) initGroupLocked(group *Group) {
 	}
 	m.groups[group.ID] = &runtimeGroupInfo{
 		Group: Group{
-			ID:              group.ID,
-			CreateTimestamp: group.CreateTimestamp,
-			LeaderStoreID:   group.LeaderStoreID,
-			VoterStoreIDs:   slices.Clone(group.VoterStoreIDs),
+			ID:                    group.ID,
+			CreateTimestamp:       group.CreateTimestamp,
+			LeaderStoreID:         group.LeaderStoreID,
+			VoterStoreIDs:         slices.Clone(group.VoterStoreIDs),
+			LeaderSource:          group.LeaderSource,
+			ExplicitLeaderStoreID: group.ExplicitLeaderStoreID,
+			ExplicitVoterStoreIDs: slices.Clone(group.ExplicitVoterStoreIDs),
 		},
 		availability:        groupDegraded,
 		degradedExpiredAt:   newDegradedExpiredAtFromNow(),
@@ -165,6 +173,9 @@ func (m *Manager) initGroupLocked(group *Group) {
 		LabelRule:           nil,
 		RangeCount:          0,
 	}
+	// Groups persisted before leader-source tracking carry no marker; treat
+	// their existing distribution as an explicit target so restarts preserve it.
+	m.groups[group.ID].normalizeLeaderSource()
 }
 
 func (m *Manager) noGroupsExist(groups []*Group) error {
@@ -204,7 +215,7 @@ func (m *Manager) resetCountLocked(groupInfo *runtimeGroupInfo) {
 	groupInfo.AffinityVer++
 }
 
-func (m *Manager) updateGroupPeers(groupID string, leaderStoreID uint64, voterStoreIDs []uint64) (*GroupState, error) {
+func (m *Manager) updateGroupPeers(groupID string, leaderStoreID uint64, voterStoreIDs []uint64, leaderSource string) (*GroupState, error) {
 	m.Lock()
 	defer m.Unlock()
 
@@ -216,6 +227,13 @@ func (m *Manager) updateGroupPeers(groupID string, leaderStoreID uint64, voterSt
 	groupInfo.SetAvailability(groupAvailable)
 	groupInfo.LeaderStoreID = leaderStoreID
 	groupInfo.VoterStoreIDs = slices.Clone(voterStoreIDs)
+	groupInfo.LeaderSource = leaderSource
+	if leaderSource == LeaderSourceExplicit {
+		groupInfo.ExplicitLeaderStoreID = leaderStoreID
+		groupInfo.ExplicitVoterStoreIDs = slices.Clone(voterStoreIDs)
+	}
+	// For LeaderSourceFallback the explicit target (if any) is kept untouched so
+	// that it can be restored once it becomes viable again.
 	m.resetCountLocked(groupInfo)
 
 	return newGroupState(groupInfo), nil
@@ -470,7 +488,10 @@ func (m *Manager) SyncGroupFromEtcd(group *Group) {
 	existingGroup, exists := m.groups[group.ID]
 	if exists &&
 		existingGroup.LeaderStoreID == group.LeaderStoreID &&
-		slices.Equal(existingGroup.VoterStoreIDs, group.VoterStoreIDs) {
+		slices.Equal(existingGroup.VoterStoreIDs, group.VoterStoreIDs) &&
+		existingGroup.LeaderSource == group.LeaderSource &&
+		existingGroup.ExplicitLeaderStoreID == group.ExplicitLeaderStoreID &&
+		slices.Equal(existingGroup.ExplicitVoterStoreIDs, group.ExplicitVoterStoreIDs) {
 		m.RUnlock()
 		return
 	}
@@ -527,6 +548,18 @@ func (m *Manager) SyncGroupFromEtcd(group *Group) {
 		}
 		if !slices.Equal(groupInfo.VoterStoreIDs, group.VoterStoreIDs) {
 			groupInfo.VoterStoreIDs = slices.Clone(group.VoterStoreIDs)
+			changed = true
+		}
+		if groupInfo.LeaderSource != group.LeaderSource {
+			groupInfo.LeaderSource = group.LeaderSource
+			changed = true
+		}
+		if groupInfo.ExplicitLeaderStoreID != group.ExplicitLeaderStoreID {
+			groupInfo.ExplicitLeaderStoreID = group.ExplicitLeaderStoreID
+			changed = true
+		}
+		if !slices.Equal(groupInfo.ExplicitVoterStoreIDs, group.ExplicitVoterStoreIDs) {
+			groupInfo.ExplicitVoterStoreIDs = slices.Clone(group.ExplicitVoterStoreIDs)
 			changed = true
 		}
 

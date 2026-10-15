@@ -300,10 +300,17 @@ func TestAffinityCheckerGroupState(t *testing.T) {
 	re.Equal("affinity-move-region", ops[0].Desc())
 	// Simulate health check invalidating the group
 	affinityManager.DegradeAffinityGroup("test_group")
-	// If the voter store IDs remain unchanged, a valid Region will cause the Group to restore.
+	// A degraded group with an explicit target must not be restored by a
+	// first-win observation: the observation is suppressed and the explicit
+	// target is preserved until availability recovers.
 	ops = affinityChecker.Check(tc.GetRegion(200))
-	re.True(affinityManager.GetAffinityGroupState("test_group").AffinitySchedulingAllowed)
-	re.Nil(ops, "Checker should not create operator for same peers")
+	re.False(affinityManager.GetAffinityGroupState("test_group").AffinitySchedulingAllowed)
+	re.Nil(ops, "Checker should not create operator for degraded group")
+	// Simulate health check restoring the group: the explicit target comes back.
+	affinityManager.RestoreAffinityGroup("test_group")
+	restored := affinityManager.GetAffinityGroupState("test_group")
+	re.True(restored.AffinitySchedulingAllowed)
+	re.Equal(affinity.LeaderSourceExplicit, restored.LeaderSource)
 }
 
 // TestAffinityAvailabilityCheckWithOfflineStore tests that groups are invalidated when stores go offline.

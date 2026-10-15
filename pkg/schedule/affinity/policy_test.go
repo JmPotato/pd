@@ -345,8 +345,13 @@ func TestStoreHealthCheck(t *testing.T) {
 	// Check health again
 	manager.checkGroupsAvailability()
 
-	// Group2 should not be restored from expired status
-	re.False(manager.groups["group2"].IsAffinitySchedulingAllowed())
+	// The explicit target (3, [3, 2]) is viable again, so the group returns to
+	// the explicit target and becomes available (see restoreExplicitTargets).
+	re.True(manager.groups["group2"].IsAffinitySchedulingAllowed())
+	group2State := manager.GetAffinityGroupState("group2")
+	re.Equal(LeaderSourceExplicit, group2State.LeaderSource)
+	re.Equal(uint64(3), group2State.LeaderStoreID)
+	re.ElementsMatch([]uint64{2, 3}, group2State.VoterStoreIDs)
 }
 
 // TestDegradedGroupShouldExpire verifies a degraded group should move to expired even when

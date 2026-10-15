@@ -17,6 +17,7 @@ package affinity
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"time"
 
 	"go.uber.org/zap"
@@ -126,6 +127,16 @@ func (m *Manager) ObserveAvailableRegion(region *core.RegionInfo, group *GroupSt
 	if group == nil || group.AffinitySchedulingAllowed {
 		return
 	}
+	// Never let a first-win observation overwrite an explicit leader target
+	// while the group is only degraded (e.g. right after a restart): the
+	// explicit target is the source of truth and affinity scheduling converges
+	// Regions toward it once the group becomes available again. When the group
+	// has expired (its target stores are unavailable), fall back to the
+	// observation as before; the explicit target is kept and restored once the
+	// stores recover (see restoreExplicitTargets).
+	if group.hasExplicitTarget() && !group.RegularSchedulingAllowed {
+		return
+	}
 	leaderStoreID := region.GetLeader().GetStoreId()
 	voterStoreIDs := make([]uint64, len(region.GetVoters()))
 	for i, voter := range region.GetVoters() {
@@ -164,11 +175,81 @@ func (m *Manager) checkGroupsAvailability() {
 		return
 	}
 	unavailableStores := m.collectUnavailableStores()
+	// The first run must be treated as a change even when the unavailable-store
+	// set is empty: groups are loaded as degraded (e.g. after a restart) and
+	// would otherwise never be re-evaluated while the set stays empty.
+	m.Lock()
+	firstCheck := !m.availabilityChecked
+	m.availabilityChecked = true
+	m.Unlock()
 	isUnavailableStoresChanged, groupAvailabilityChanges := m.getGroupAvailabilityChanges(unavailableStores)
+	if firstCheck {
+		isUnavailableStoresChanged = true
+	}
 	if isUnavailableStoresChanged {
 		m.setGroupAvailabilityChanges(unavailableStores, groupAvailabilityChanges)
 	}
+	m.restoreExplicitTargets(unavailableStores)
 	m.collectMetrics()
+}
+
+// restoreExplicitTargets moves groups whose effective distribution is a
+// first-win fallback back to their explicit target once every explicit-target
+// store is fully available. It also covers expired groups, which the
+// availability changes above treat as terminal: with an explicit target,
+// recovery is well-defined, so the group returns to the explicit target and
+// becomes available again.
+func (m *Manager) restoreExplicitTargets(unavailableStores map[uint64]storeCondition) {
+	type restoreTarget struct {
+		id     string
+		leader uint64
+		voters []uint64
+	}
+	var restoreOps []restoreTarget
+	m.RLock()
+	for _, groupInfo := range m.groups {
+		if !groupInfo.hasExplicitTarget() {
+			continue
+		}
+		// Already enforcing the explicit target and viable — nothing to restore.
+		if groupInfo.LeaderSource == LeaderSourceExplicit && groupInfo.GetAvailability() == groupAvailable {
+			continue
+		}
+		if explicitStoresAvailable(unavailableStores, groupInfo.ExplicitLeaderStoreID, groupInfo.ExplicitVoterStoreIDs) {
+			restoreOps = append(restoreOps, restoreTarget{
+				id:     groupInfo.ID,
+				leader: groupInfo.ExplicitLeaderStoreID,
+				voters: slices.Clone(groupInfo.ExplicitVoterStoreIDs),
+			})
+		}
+	}
+	m.RUnlock()
+
+	for _, target := range restoreOps {
+		// The admin path persists the explicit target and marks the group available.
+		if _, err := m.UpdateAffinityGroupPeers(target.id, target.leader, target.voters); err != nil {
+			log.Warn("failed to restore explicit leader target for affinity group",
+				zap.String("group-id", target.id),
+				zap.Error(err))
+			continue
+		}
+		log.Info("restored explicit leader target for affinity group", zap.String("group-id", target.id))
+	}
+}
+
+// explicitStoresAvailable reports whether every store of the explicit peer
+// distribution is currently fully available (i.e. not in unavailableStores at
+// all — any degradation counts as not viable for the explicit target).
+func explicitStoresAvailable(unavailableStores map[uint64]storeCondition, leaderStoreID uint64, voterStoreIDs []uint64) bool {
+	if leaderStoreID == 0 || len(voterStoreIDs) == 0 {
+		return false
+	}
+	for _, storeID := range voterStoreIDs {
+		if _, unhealthy := unavailableStores[storeID]; unhealthy {
+			return false
+		}
+	}
+	return true
 }
 
 // collectMetrics collects the global metrics of the affinity manager.

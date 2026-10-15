@@ -341,6 +341,21 @@ func (m *Manager) updateAffinityGroupPeersWithAffinityVer(groupID string, affini
 	// Step 2: Save the Group in storage.
 	group.LeaderStoreID = leaderStoreID
 	group.VoterStoreIDs = slices.Clone(voterStoreIDs)
+	var source string
+	if affinityVer == 0 {
+		// Explicit admin (PUT) update: persist the target as the group's explicit
+		// target so restarts, degraded periods, and store outages preserve it.
+		source = LeaderSourceExplicit
+		group.LeaderSource = LeaderSourceExplicit
+		group.ExplicitLeaderStoreID = leaderStoreID
+		group.ExplicitVoterStoreIDs = slices.Clone(voterStoreIDs)
+	} else {
+		// First-win observation: the effective distribution is derived from an
+		// observed Region. Keep any explicit target untouched so it can be
+		// restored once it becomes viable again.
+		source = LeaderSourceFallback
+		group.LeaderSource = LeaderSourceFallback
+	}
 	if err := m.storage.RunInTxn(m.ctx, func(txn kv.Txn) error {
 		return m.storage.SaveAffinityGroup(txn, groupID, &group.Group)
 	}); err != nil {
@@ -348,7 +363,7 @@ func (m *Manager) updateAffinityGroupPeersWithAffinityVer(groupID string, affini
 	}
 
 	// Step 3: Save the information in memory.
-	return m.updateGroupPeers(groupID, leaderStoreID, voterStoreIDs)
+	return m.updateGroupPeers(groupID, leaderStoreID, voterStoreIDs, source)
 }
 
 // UpdateAffinityGroupKeyRanges batch modifies key ranges for multiple affinity groups.

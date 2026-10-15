@@ -758,6 +758,14 @@ type AffinityGroup struct {
 	CreateTimestamp uint64   `json:"create_timestamp"`
 	LeaderStoreID   uint64   `json:"leader_store_id,omitempty"`
 	VoterStoreIDs   []uint64 `json:"voter_store_ids,omitempty"`
+	// LeaderSource indicates how the effective distribution was determined:
+	// "explicit" (set via the peers-update API) or "fallback" (derived from a
+	// first-win Region observation). Empty means no distribution yet.
+	LeaderSource string `json:"leader_source,omitempty"`
+	// Explicit peer distribution set via the peers-update API, kept while a
+	// fallback distribution is in effect.
+	ExplicitLeaderStoreID uint64   `json:"explicit_leader_store_id,omitempty"`
+	ExplicitVoterStoreIDs []uint64 `json:"explicit_voter_store_ids,omitempty"`
 }
 
 // AffinityGroupState defines the runtime state of an affinity group.
