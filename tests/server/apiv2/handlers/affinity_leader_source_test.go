@@ -31,7 +31,6 @@ import (
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/schedule/affinity"
 	"github.com/tikv/pd/pkg/utils/testutil"
-	"github.com/tikv/pd/pkg/utils/typeutil"
 	"github.com/tikv/pd/server/apiv2/handlers"
 	"github.com/tikv/pd/server/config"
 	"github.com/tikv/pd/tests"
@@ -53,8 +52,6 @@ func TestAffinityLeaderSourceSuite(t *testing.T) {
 func (suite *affinityLeaderSourceSuite) SetupSuite() {
 	suite.env = tests.NewSchedulingTestEnvironment(suite.T(), func(conf *config.Config, _ string) {
 		conf.Schedule.AffinityScheduleLimit = 4
-		// Keeps the debounced explicit-target restore short enough to observe.
-		conf.Schedule.MaxStoreDownTime = typeutil.NewDuration(30 * time.Second)
 		conf.LabelProperty = config.LabelPropertyConfig{
 			"reject-leader": {{Key: "reject", Value: "leader"}},
 		}
@@ -384,7 +381,7 @@ func (suite *affinityLeaderSourceSuite) TestAffinityExplicitTargetRestoredAfterS
 			return state.LeaderSource == affinity.LeaderSourceExplicit &&
 				state.LeaderStoreID == 1 &&
 				state.Phase != affinity.PhasePending
-		}, testutil.WithWaitFor(90*time.Second))
+		}, testutil.WithWaitFor(120*time.Second))
 		close(stopRefresh)
 		<-refreshDone
 		re.ElementsMatch([]uint64{1, 2, 3}, state.VoterStoreIDs)

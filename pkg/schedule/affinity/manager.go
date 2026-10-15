@@ -108,9 +108,10 @@ func NewManager(ctx context.Context, storage endpoint.AffinityStorage, storeSetI
 		unavailableStores:   make(map[uint64]storeCondition),
 		keyRanges:           make(map[string]GroupKeyRanges),
 		labelRuleBuffer:     make(map[string]*labeler.LabelRule),
-		// Same magnitude as max-store-down-time: a store must prove it stays
-		// up before groups migrate back to it.
-		restoreDebounce: conf.GetMaxStoreDownTime(),
+		// Six consecutive availability checks (~60s): the explicit-target
+		// stores must prove they stay up before groups migrate back to them,
+		// so a store-health flap cannot cause repeated leader migrations.
+		restoreDebounce: 6 * defaultAvailabilityCheckInterval,
 	}
 	if err := m.initialize(); err != nil {
 		return nil, err

@@ -263,6 +263,9 @@ func explicitStoresAvailable(unavailableStores map[uint64]storeCondition, leader
 	if leaderStoreID == 0 || len(voterStoreIDs) == 0 {
 		return false
 	}
+	if _, unhealthy := unavailableStores[leaderStoreID]; unhealthy {
+		return false
+	}
 	for _, storeID := range voterStoreIDs {
 		if _, unhealthy := unavailableStores[storeID]; unhealthy {
 			return false
