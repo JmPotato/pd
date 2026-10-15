@@ -36,6 +36,9 @@ type leaderSourceTestEnv struct {
 	stores  *core.StoresInfo
 	store   storage.Storage
 	ctx     context.Context
+	// restoreDebounce overrides the manager's restore debounce after
+	// NewManager. Zero keeps the default (max-store-down-time).
+	restoreDebounce time.Duration
 }
 
 func newLeaderSourceTestEnv(t *testing.T, storeCount int) *leaderSourceTestEnv {
@@ -59,7 +62,8 @@ func newLeaderSourceTestEnv(t *testing.T, storeCount int) *leaderSourceTestEnv {
 	re.NoError(err)
 	manager, err := NewManager(ctx, memStorage, storeInfos, conf, regionLabeler)
 	re.NoError(err)
-	return &leaderSourceTestEnv{manager: manager, stores: storeInfos, store: memStorage, ctx: ctx}
+	env := &leaderSourceTestEnv{manager: manager, stores: storeInfos, store: memStorage, ctx: ctx}
+	return env
 }
 
 // newRestartedManager simulates a PD restart: a fresh manager (and labeler)
@@ -146,6 +150,8 @@ func TestExplicitTargetSurvivesDegradedObservation(t *testing.T) {
 func TestExplicitTargetFallsBackWhenExpiredAndRestores(t *testing.T) {
 	re := require.New(t)
 	env := newLeaderSourceTestEnv(t, 3)
+	env.restoreDebounce = 0
+	env.manager.restoreDebounce = 0
 
 	re.NoError(env.manager.CreateAffinityGroups([]GroupKeyRanges{{GroupID: "g"}}))
 	_, err := env.manager.UpdateAffinityGroupPeers("g", 1, []uint64{1, 2, 3})
@@ -384,4 +390,56 @@ func TestSyncGroupFromEtcdCarriesLeaderSource(t *testing.T) {
 	re.Equal(LeaderSourceExplicit, state.LeaderSource)
 	re.Equal(uint64(3), state.ExplicitLeaderStoreID)
 	re.ElementsMatch([]uint64{1, 3}, state.ExplicitVoterStoreIDs)
+}
+
+// TestRestoreDebounceGuardsAgainstFlapping verifies that after a fallback the
+// restore to the explicit target only happens after the explicit-target stores
+// have stayed healthy for the whole debounce window, and that a flap during
+// the window restarts the wait.
+func TestRestoreDebounceGuardsAgainstFlapping(t *testing.T) {
+	re := require.New(t)
+	env := newLeaderSourceTestEnv(t, 3)
+	env.manager.restoreDebounce = 2 * time.Second
+
+	re.NoError(env.manager.CreateAffinityGroups([]GroupKeyRanges{{GroupID: "g"}}))
+	_, err := env.manager.UpdateAffinityGroupPeers("g", 1, []uint64{1, 2, 3})
+	re.NoError(err)
+
+	// Store 1 goes down: the group expires and falls back to an observation.
+	env.setStoreHealth(t, 1, false)
+	env.manager.checkGroupsAvailability()
+	env.manager.ObserveAvailableRegion(regionOn(10, []byte("a"), []byte("b"), 2, 3), env.manager.GetAffinityGroupState("g"))
+	state := env.manager.GetAffinityGroupState("g")
+	re.Equal(LeaderSourceFallback, state.LeaderSource)
+
+	// Store 1 recovers: the first tick arms the debounce window without
+	// restoring.
+	env.setStoreHealth(t, 1, true)
+	env.manager.checkGroupsAvailability()
+	state = env.manager.GetAffinityGroupState("g")
+	re.Equal(LeaderSourceFallback, state.LeaderSource, "debounce must delay the restore")
+
+	// A flap during the window restarts the wait.
+	env.setStoreHealth(t, 1, false)
+	env.manager.checkGroupsAvailability()
+	env.setStoreHealth(t, 1, true)
+	env.manager.checkGroupsAvailability()
+	state = env.manager.GetAffinityGroupState("g")
+	re.Equal(LeaderSourceFallback, state.LeaderSource, "flapping must restart the debounce window")
+
+	// Once the window elapses, the group returns to the explicit target.
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		env.manager.checkGroupsAvailability()
+		state = env.manager.GetAffinityGroupState("g")
+		if state.LeaderSource == LeaderSourceExplicit {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	state = env.manager.GetAffinityGroupState("g")
+	re.Equal(LeaderSourceExplicit, state.LeaderSource)
+	re.True(state.AffinitySchedulingAllowed)
+	re.Equal(uint64(1), state.LeaderStoreID)
+	re.ElementsMatch([]uint64{1, 2, 3}, state.VoterStoreIDs)
 }

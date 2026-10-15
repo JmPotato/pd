@@ -210,6 +210,10 @@ type runtimeGroupInfo struct {
 	LabelRule *labeler.LabelRule
 	// RangeCount counts how many KeyRanges exist in the Label.
 	RangeCount int
+	// restoreEligibleAt tracks (unix seconds) when the explicit target first
+	// became viable again after a fallback, for the debounced restore. Zero
+	// means not eligible yet. In-memory only.
+	restoreEligibleAt uint64
 }
 
 // newGroupState creates a GroupState from the given runtimeGroupInfo.

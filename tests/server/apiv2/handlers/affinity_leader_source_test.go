@@ -31,6 +31,7 @@ import (
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/schedule/affinity"
 	"github.com/tikv/pd/pkg/utils/testutil"
+	"github.com/tikv/pd/pkg/utils/typeutil"
 	"github.com/tikv/pd/server/apiv2/handlers"
 	"github.com/tikv/pd/server/config"
 	"github.com/tikv/pd/tests"
@@ -52,6 +53,8 @@ func TestAffinityLeaderSourceSuite(t *testing.T) {
 func (suite *affinityLeaderSourceSuite) SetupSuite() {
 	suite.env = tests.NewSchedulingTestEnvironment(suite.T(), func(conf *config.Config, _ string) {
 		conf.Schedule.AffinityScheduleLimit = 4
+		// Keeps the debounced explicit-target restore short enough to observe.
+		conf.Schedule.MaxStoreDownTime = typeutil.NewDuration(30 * time.Second)
 		conf.LabelProperty = config.LabelPropertyConfig{
 			"reject-leader": {{Key: "reject", Value: "leader"}},
 		}
@@ -269,7 +272,6 @@ func (suite *affinityLeaderSourceSuite) TestAffinityExplicitTargetSurvivesPDRest
 	suite.assertBalancedTargets(re, cluster)
 }
 
-
 // TestAffinityExplicitTargetRestoredAfterStoreOutage covers the full outage
 // cycle: explicit target -> target store down (expired, fallback takes over) ->
 // store recovers -> explicit target restored.
@@ -344,12 +346,47 @@ func (suite *affinityLeaderSourceSuite) TestAffinityExplicitTargetRestoredAfterS
 			State:     metapb.StoreState_Up,
 			NodeState: metapb.NodeState_Serving,
 		}, time.Now())
+		// The restore is debounced (max-store-down-time) so the explicit target
+		// stores must stay healthy for that window first. Real TiKV stores keep
+		// heartbeating; emulate that with a background refresher.
+		stopRefresh := make(chan struct{})
+		refreshDone := make(chan struct{})
+		go func() {
+			defer close(refreshDone)
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			put := func(storeID uint64) {
+				raftCluster := leader.GetServer().GetRaftCluster()
+				if raftCluster == nil {
+					return
+				}
+				storeInfo := raftCluster.GetStore(storeID)
+				if storeInfo == nil {
+					return
+				}
+				newStore := storeInfo.Clone(core.SetLastHeartbeatTS(time.Now()))
+				raftCluster.GetBasicCluster().PutStore(newStore)
+				raftCluster.UpdateAllStoreStatus()
+			}
+			for {
+				select {
+				case <-stopRefresh:
+					return
+				case <-ticker.C:
+					for id := uint64(1); id <= 3; id++ {
+						put(id)
+					}
+				}
+			}
+		}()
 		testutil.Eventually(re, func() bool {
 			state = mustGetAffinityGroup(re, serverAddr, "outage")
 			return state.LeaderSource == affinity.LeaderSourceExplicit &&
 				state.LeaderStoreID == 1 &&
 				state.Phase != affinity.PhasePending
-		})
+		}, testutil.WithWaitFor(90*time.Second))
+		close(stopRefresh)
+		<-refreshDone
 		re.ElementsMatch([]uint64{1, 2, 3}, state.VoterStoreIDs)
 	})
 }

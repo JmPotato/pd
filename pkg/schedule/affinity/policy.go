@@ -179,13 +179,10 @@ func (m *Manager) checkGroupsAvailability() {
 	// set is empty: groups are loaded as degraded (e.g. after a restart) and
 	// would otherwise never be re-evaluated while the set stays empty.
 	m.Lock()
-	firstCheck := !m.availabilityChecked
+	force := !m.availabilityChecked
 	m.availabilityChecked = true
 	m.Unlock()
-	isUnavailableStoresChanged, groupAvailabilityChanges := m.getGroupAvailabilityChanges(unavailableStores)
-	if firstCheck {
-		isUnavailableStoresChanged = true
-	}
+	isUnavailableStoresChanged, groupAvailabilityChanges := m.getGroupAvailabilityChanges(unavailableStores, force)
 	if isUnavailableStoresChanged {
 		m.setGroupAvailabilityChanges(unavailableStores, groupAvailabilityChanges)
 	}
@@ -195,10 +192,13 @@ func (m *Manager) checkGroupsAvailability() {
 
 // restoreExplicitTargets moves groups whose effective distribution is a
 // first-win fallback back to their explicit target once every explicit-target
-// store is fully available. It also covers expired groups, which the
-// availability changes above treat as terminal: with an explicit target,
-// recovery is well-defined, so the group returns to the explicit target and
-// becomes available again.
+// store has stayed fully available for restoreDebounce. The debounce guards
+// against store-health flapping: without it, every flap would toggle the
+// group between the fallback and explicit targets, migrating all of its
+// leaders each time. It also covers expired groups, which the availability
+// changes above treat as terminal: with an explicit target, recovery is
+// well-defined, so the group returns to the explicit target and becomes
+// available again.
 func (m *Manager) restoreExplicitTargets(unavailableStores map[uint64]storeCondition) {
 	type restoreTarget struct {
 		id     string
@@ -206,24 +206,43 @@ func (m *Manager) restoreExplicitTargets(unavailableStores map[uint64]storeCondi
 		voters []uint64
 	}
 	var restoreOps []restoreTarget
-	m.RLock()
+	now := uint64(time.Now().Unix())
+	debounce := uint64(m.restoreDebounce.Seconds())
+
+	m.Lock()
 	for _, groupInfo := range m.groups {
 		if !groupInfo.hasExplicitTarget() {
 			continue
 		}
 		// Already enforcing the explicit target and viable — nothing to restore.
 		if groupInfo.LeaderSource == LeaderSourceExplicit && groupInfo.GetAvailability() == groupAvailable {
+			groupInfo.restoreEligibleAt = 0
 			continue
 		}
-		if explicitStoresAvailable(unavailableStores, groupInfo.ExplicitLeaderStoreID, groupInfo.ExplicitVoterStoreIDs) {
-			restoreOps = append(restoreOps, restoreTarget{
-				id:     groupInfo.ID,
-				leader: groupInfo.ExplicitLeaderStoreID,
-				voters: slices.Clone(groupInfo.ExplicitVoterStoreIDs),
-			})
+		if !explicitStoresAvailable(unavailableStores, groupInfo.ExplicitLeaderStoreID, groupInfo.ExplicitVoterStoreIDs) {
+			// The explicit target is not viable (yet); restart the debounce
+			// window on the next consecutive healthy streak.
+			groupInfo.restoreEligibleAt = 0
+			continue
 		}
+		if debounce > 0 && groupInfo.restoreEligibleAt == 0 {
+			groupInfo.restoreEligibleAt = now + debounce
+			log.Info("explicit leader target viable, waiting before restore",
+				zap.String("group-id", groupInfo.ID),
+				zap.Uint64("debounce-seconds", debounce))
+			continue
+		}
+		if now < groupInfo.restoreEligibleAt {
+			continue
+		}
+		groupInfo.restoreEligibleAt = 0
+		restoreOps = append(restoreOps, restoreTarget{
+			id:     groupInfo.ID,
+			leader: groupInfo.ExplicitLeaderStoreID,
+			voters: slices.Clone(groupInfo.ExplicitVoterStoreIDs),
+		})
 	}
-	m.RUnlock()
+	m.Unlock()
 
 	for _, target := range restoreOps {
 		// The admin path persists the explicit target and marks the group available.
@@ -296,14 +315,16 @@ func (m *Manager) collectUnavailableStores() map[uint64]storeCondition {
 	return unavailableStores
 }
 
-func (m *Manager) getGroupAvailabilityChanges(unavailableStores map[uint64]storeCondition) (isUnavailableStoresChanged bool, groupAvailabilityChanges map[string]groupAvailability) {
+func (m *Manager) getGroupAvailabilityChanges(unavailableStores map[uint64]storeCondition, force bool) (isUnavailableStoresChanged bool, groupAvailabilityChanges map[string]groupAvailability) {
 	groupAvailabilityChanges = make(map[string]groupAvailability)
 	availableGroupCount := 0
 	unavailableGroupCount := 0
 
-	// Validate whether unavailableStores has changed.
+	// Validate whether unavailableStores has changed. The first evaluation is
+	// forced: groups are loaded as degraded, and an empty set that never
+	// changes must still be applied once.
 	m.RLock()
-	isUnavailableStoresChanged = !maps.Equal(unavailableStores, m.unavailableStores)
+	isUnavailableStoresChanged = force || !maps.Equal(unavailableStores, m.unavailableStores)
 	if !isUnavailableStoresChanged {
 		m.RUnlock()
 		return false, nil

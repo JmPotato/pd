@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -76,6 +77,11 @@ type Manager struct {
 	// unavailable-store set is empty, otherwise groups loaded as degraded
 	// (e.g. after a restart) would never be re-evaluated.
 	availabilityChecked bool
+	// restoreDebounce is how long the explicit-target stores must stay
+	// continuously healthy before a fallback group is restored to its explicit
+	// target. It guards against store-health flapping causing repeated leader
+	// migrations. Zero restores immediately (used by tests).
+	restoreDebounce time.Duration
 
 	// The following members are protected by metaMutex only, not protected by RWMutex.
 	// keyRanges cached in memory to reduce labeler lock contention
@@ -102,6 +108,9 @@ func NewManager(ctx context.Context, storage endpoint.AffinityStorage, storeSetI
 		unavailableStores:   make(map[uint64]storeCondition),
 		keyRanges:           make(map[string]GroupKeyRanges),
 		labelRuleBuffer:     make(map[string]*labeler.LabelRule),
+		// Same magnitude as max-store-down-time: a store must prove it stays
+		// up before groups migrate back to it.
+		restoreDebounce: conf.GetMaxStoreDownTime(),
 	}
 	if err := m.initialize(); err != nil {
 		return nil, err
